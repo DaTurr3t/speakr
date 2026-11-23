@@ -161,13 +161,14 @@ def test_downloads_record_part_and_format_from_fixed_codes(created):
     start = max_id()
     assert client.get(f'/recording/{recording.id}/download/transcript?format={SENTINEL}').status_code == 200
     assert client.get(f'/recording/{recording.id}/download/transcript?format=md').status_code == 200
+    assert client.get(f'/recording/{recording.id}/download/transcript?format=pdf').status_code == 200
     assert client.get(f'/recording/{recording.id}/download/summary').status_code == 200
     assert client.get(f'/recording/{recording.id}/download/summary?format=md').status_code == 200
     assert client.get(f'/recording/{recording.id}/download/notes').status_code == 200
     rows = rows_after(start, 'recording.downloaded')
     assert [r.details for r in rows] == [
         {'part': 'transcript', 'format': 'txt'}, {'part': 'transcript', 'format': 'md'},
-        {'part': 'summary', 'format': 'docx'}, {'part': 'summary', 'format': 'md'},
+        {'part': 'transcript', 'format': 'pdf'}, {'part': 'summary', 'format': 'docx'}, {'part': 'summary', 'format': 'md'},
         {'part': 'notes', 'format': 'docx'}]
     assert all(r.dedup_key is None and r.recording_id == recording.id for r in rows)
     assert SENTINEL not in _dump(rows_after(start))

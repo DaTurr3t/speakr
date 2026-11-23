@@ -5,6 +5,7 @@ Document processing and conversion services.
 import re
 from email.utils import encode_rfc2231
 from io import BytesIO
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from docx import Document
@@ -15,8 +16,46 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 from docx.text.run import Run
 from flask import current_app, make_response, request, send_file
+from fpdf import FPDF
 
 DOCX_MIMETYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+PDF_MIMETYPE = 'application/pdf'
+
+# The PDF downloads embed DejaVu Sans (static/fonts, Bitstream Vera license):
+# the PDF core fonts only cover Latin-1, DejaVu Sans also covers umlauts,
+# accents, Greek and Cyrillic.
+_PDF_FONT_DIR = Path(__file__).resolve().parents[2] / 'static' / 'fonts'
+_PDF_FONT_FAMILY = 'DejaVuSans'
+# Control characters other than newline and tab have no glyph and would be
+# drawn as boxes
+_PDF_CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
+
+
+def _pdf_text(text):
+    """text with Windows/Mac line endings, tabs and control characters made printable."""
+    text = str(text or '').replace('\r\n', '\n').replace('\r', '\n').replace('\t', '    ')
+    return _PDF_CONTROL_CHARS.sub('', text)
+
+
+def render_text_to_pdf(title, body):
+    """An A4 PDF of body (plain text, line breaks kept) under a bold title, as bytes."""
+    pdf = FPDF(format='A4')
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_font(_PDF_FONT_FAMILY, '', str(_PDF_FONT_DIR / 'DejaVuSans.ttf'))
+    pdf.add_font(_PDF_FONT_FAMILY, 'B', str(_PDF_FONT_DIR / 'DejaVuSans-Bold.ttf'))
+    title = _pdf_text(title).strip() or 'Transcript'
+    pdf.set_title(title)
+    pdf.set_creator('Speakr')
+    pdf.add_page()
+    # new_x/new_y return to the left margin below each block; fpdf2's default
+    # leaves x at the right margin, where the next full-width cell has no room.
+    # Left-aligned: fpdf2 justifies by default, which stretches short lines.
+    pdf.set_font(_PDF_FONT_FAMILY, 'B', 16)
+    pdf.multi_cell(0, 9, title, align='L', new_x='LMARGIN', new_y='NEXT')
+    pdf.ln(4)
+    pdf.set_font(_PDF_FONT_FAMILY, '', 10)
+    pdf.multi_cell(0, 5, _pdf_text(body), align='L', new_x='LMARGIN', new_y='NEXT')
+    return bytes(pdf.output())
 
 # One font for all text in the Word downloads. Arial covers Latin, Cyrillic
 # and, through Word's font fallback, CJK text; it is also the east-Asia font.
