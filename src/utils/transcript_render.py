@@ -101,6 +101,30 @@ def render_segments(segments, template_format, header=None):
     return body
 
 
+# A {{speaker}} placeholder with the brackets around it and the separator after
+# it ("[{{speaker}}]: ", "{{speaker|upper}} - "), for layouts that show the
+# speaker apart from the segment line.
+_SPEAKER_PART = re.compile(r'\s*[\[(<]?\{\{speaker(?:\|upper)?\}\}[\])>]?\s*[:\-–—|]?\s*')
+
+
+def speaker_turns(segments, template_format):
+    """The segments grouped into turns of consecutive segments by the same
+    speaker, as a list of (speaker, lines). Each line is the segment rendered
+    with `template_format` minus its speaker placeholder, since the speaker is
+    shown once per turn."""
+    line_format = _SPEAKER_PART.sub(' ', template_format).strip()
+    turns = []
+    for index, segment in enumerate(segments, 1):
+        speaker = segment.get('speaker') or 'Unknown'
+        # Rendered one at a time, so {{index}} is filled in here
+        line = render_segments([segment], line_format.replace('{{index}}', str(index))).strip()
+        if turns and turns[-1][0] == speaker:
+            turns[-1][1].append(line)
+        else:
+            turns.append((speaker, [line]))
+    return turns
+
+
 def render_transcription(transcription_text, template_format):
     """Render the transcript JSON with `template_format`.
 

@@ -39,7 +39,7 @@ from src.services.transcription_defaults import (
 )
 from src.utils.dates import filter_day, filter_year_ok, to_utc_naive
 from src.utils.log_filters import loggable_error, loggable_locator
-from src.utils.transcript_render import BASIC_TEMPLATE_FORMAT, parse_segments, render_segments
+from src.utils.transcript_render import BASIC_TEMPLATE_FORMAT, parse_segments, render_segments, speaker_turns
 from src.services.speaker import (
     update_speaker_usage, apply_speaker_map, participants_from_segments, update_voice_profiles,
 )
@@ -48,7 +48,7 @@ from src.services.speaker import (
 from src.services.document import (
     absolutize_markdown_links, add_document_header, append_conversation_turn,
     PDF_MIMETYPE, docx_attachment_response, link_base_url, markdown_attachment_response,
-    new_document, process_markdown_to_docx, render_text_to_pdf,
+    new_document, process_markdown_to_docx, render_text_to_pdf, render_turns_to_pdf,
 )
 from src.services.llm import client, chat_client, call_chat_completion, process_streaming_with_thinking, TokenBudgetExceeded
 from src.services.embeddings import process_recording_chunks
@@ -186,15 +186,29 @@ def download_transcript_with_template(recording_id):
 
         # Output format: 'txt' (default), 'md' or 'pdf'. Markdown wraps the
         # templated body with a title heading so it renders as a proper
-        # document, and swaps the extension + content-type. The PDF sets the
-        # same templated text as plain text under the title. The transcript
-        # body itself is the same templated text in all cases (the template
-        # lines are valid markdown as-is).
+        # document, and swaps the extension + content-type. The transcript
+        # body itself is the same templated text for TXT and MD (the template
+        # lines are valid markdown as-is). The PDF of a diarized transcript is
+        # laid out as speaker turns (see below); a plain one is set as text.
         output_format = (request.args.get('format') or 'txt').lower()
         if output_format not in TRANSCRIPT_DOWNLOAD_FORMATS:
             output_format = 'txt'
 
-        if output_format == 'pdf':
+        if output_format == 'pdf' and is_diarized:
+            # Laid out as speaker turns: the speaker as a colored label where
+            # the speaker changes, the template line without its speaker part
+            # for each segment.
+            if raw:
+                line_format, header = '{{text}}', None
+            elif template:
+                line_format, header = template.template, template.header
+            else:
+                line_format, header = BASIC_TEMPLATE_FORMAT, None
+            response = make_response(render_turns_to_pdf(
+                recording.title or 'Transcript', speaker_turns(segments, line_format), header))
+            ext = 'pdf'
+            content_type = PDF_MIMETYPE
+        elif output_format == 'pdf':
             response = make_response(render_text_to_pdf(recording.title or 'Transcript', formatted_transcript))
             ext = 'pdf'
             content_type = PDF_MIMETYPE

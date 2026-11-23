@@ -37,8 +37,19 @@ def _pdf_text(text):
     return _PDF_CONTROL_CHARS.sub('', text)
 
 
-def render_text_to_pdf(title, body):
-    """An A4 PDF of body (plain text, line breaks kept) under a bold title, as bytes."""
+# Speaker label colors of the PDF: the light-theme .speaker-color-N palette of
+# the transcript view (static/css/styles.css), as (background, text), assigned
+# in order of first appearance like in the app.
+_PDF_SPEAKER_COLORS = (
+    ('#E3F2FD', '#0D47A1'), ('#F3E5F5', '#6A1B9A'), ('#E8F5E9', '#1B5E20'), ('#FFF3E0', '#B23C00'),
+    ('#FCE4EC', '#AD1457'), ('#E0F7FA', '#006064'), ('#FFF9C4', '#8A5A00'), ('#EFEBE9', '#5D4037'),
+    ('#E8EAF6', '#283593'), ('#F1F8E9', '#476F26'), ('#FFEBEE', '#C62828'), ('#ECEFF1', '#37474F'),
+    ('#FFF8E1', '#8A5200'), ('#EDE7F6', '#4527A0'), ('#E0F2F1', '#00695C'), ('#FBE9E7', '#BF360C'),
+)
+
+
+def _new_pdf(title):
+    """An A4 FPDF with the fonts loaded and the bold title written, and the title."""
     pdf = FPDF(format='A4')
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_font(_PDF_FONT_FAMILY, '', str(_PDF_FONT_DIR / 'DejaVuSans.ttf'))
@@ -53,8 +64,50 @@ def render_text_to_pdf(title, body):
     pdf.set_font(_PDF_FONT_FAMILY, 'B', 16)
     pdf.multi_cell(0, 9, title, align='L', new_x='LMARGIN', new_y='NEXT')
     pdf.ln(4)
+    return pdf
+
+
+def render_text_to_pdf(title, body):
+    """An A4 PDF of body (plain text, line breaks kept) under a bold title, as bytes."""
+    pdf = _new_pdf(title)
     pdf.set_font(_PDF_FONT_FAMILY, '', 10)
     pdf.multi_cell(0, 5, _pdf_text(body), align='L', new_x='LMARGIN', new_y='NEXT')
+    return bytes(pdf.output())
+
+
+def render_turns_to_pdf(title, turns, header=None):
+    """An A4 PDF of a diarized transcript under a bold title, as bytes.
+
+    turns is a list of (speaker, lines) as from speaker_turns(): each turn
+    starts with the speaker's name as a colored label, followed by its lines,
+    so the name only appears where the speaker changes. A non-empty header
+    comes between the title and the first turn."""
+    pdf = _new_pdf(title)
+    header = _pdf_text(header).rstrip('\n')
+    if header.strip():
+        pdf.set_font(_PDF_FONT_FAMILY, '', 10)
+        pdf.multi_cell(0, 5, header, align='L', new_x='LMARGIN', new_y='NEXT')
+        pdf.ln(4)
+    colors = {}
+    for number, (speaker, lines) in enumerate(turns):
+        speaker = _pdf_text(speaker).replace('\n', ' ').strip() or 'Unknown'
+        background, text_color = colors.setdefault(
+            speaker, _PDF_SPEAKER_COLORS[len(colors) % len(_PDF_SPEAKER_COLORS)])
+        if number:
+            pdf.ln(3)
+        pdf.set_font(_PDF_FONT_FAMILY, 'B', 10)
+        # The label and the first line of its turn stay on one page
+        if pdf.will_page_break(6 + 1 + 5):
+            pdf.add_page()
+        # A pill as wide as the name (with padding), at most the full line
+        width = min(pdf.get_string_width(speaker) + 2 * pdf.c_margin + 2, pdf.epw)
+        pdf.set_fill_color(background)
+        pdf.set_text_color(text_color)
+        pdf.multi_cell(width, 6, speaker, align='L', fill=True, new_x='LMARGIN', new_y='NEXT')
+        pdf.set_text_color(0)
+        pdf.ln(1)
+        pdf.set_font(_PDF_FONT_FAMILY, '', 10)
+        pdf.multi_cell(0, 5, _pdf_text('\n'.join(lines)), align='L', new_x='LMARGIN', new_y='NEXT')
     return bytes(pdf.output())
 
 # One font for all text in the Word downloads. Arial covers Latin, Cyrillic
