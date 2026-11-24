@@ -4,6 +4,7 @@ const { createApp, ref, reactive, computed, onMounted, onUnmounted, watch, nextT
 import { useRecordings } from './modules/composables/recordings.js';
 import { isValidDateInput } from './modules/utils/date-filter.js';
 import { resolveInitialSort } from './modules/utils/sort-preference.js';
+import { normalizeTranscriptFormat } from './modules/utils/transcript-format.js';
 import { releasesToShow, releaseVersion } from './modules/utils/whats-new.js';
 import { useUpload } from './modules/composables/upload.js';
 import { useAudio } from './modules/composables/audio.js';
@@ -930,10 +931,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Split-button menu on the recording-view "Upload Recording & Notes"
             // action (offers "merge with an existing recording").
             const showUploadSplitMenu = ref(false);
-            // Preferred transcript download format ('txt' | 'md'), persisted.
-            const transcriptDownloadFormat = ref(localStorage.getItem('transcriptDownloadFormat') === 'md' ? 'md' : 'txt');
+            // Preferred transcript download format ('txt' | 'md' | 'pdf'), persisted.
+            const transcriptDownloadFormat = ref(normalizeTranscriptFormat(localStorage.getItem('transcriptDownloadFormat')));
             watch(transcriptDownloadFormat, (val) => {
-                localStorage.setItem('transcriptDownloadFormat', val === 'md' ? 'md' : 'txt');
+                localStorage.setItem('transcriptDownloadFormat', normalizeTranscriptFormat(val));
             });
             const currentPlayingSegmentIndex = ref(null);
             const followPlayerMode = ref(false);

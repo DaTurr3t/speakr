@@ -5,6 +5,7 @@
 
 import { savedColorScheme } from '../utils/theme-defaults.js';
 import { filenameFromContentDisposition } from '../utils/content-disposition.js';
+import { normalizeTranscriptFormat } from '../utils/transcript-format.js';
 import { confirmDialog } from '../utils/dialogs.js';
 import { realSpeakers } from '../utils/speaker-labels.js';
 
@@ -1794,10 +1795,12 @@ export function useUI(state, utils, processedTranscription) {
                 }
             }
 
-            const fmt = transcriptDownloadFormat.value === 'md' ? 'md' : 'txt';
+            const fmt = normalizeTranscriptFormat(transcriptDownloadFormat.value);
 
-            // If templateId is 'none', download raw transcript without any template
-            if (templateId === 'none') {
+            // If templateId is 'none', download raw transcript without any
+            // template. TXT and MD are built here; a PDF is rendered by the
+            // server (raw=1 below).
+            if (templateId === 'none' && fmt !== 'pdf') {
                 let rawText = '';
                 try {
                     const transcriptionData = JSON.parse(displayed);
@@ -1832,10 +1835,11 @@ export function useUI(state, utils, processedTranscription) {
             }
 
             // Download the transcript with the selected template
-            const translationParam = viewingTranslation.value ? '&translation=1' : '';
-            const url = templateId
-                ? `/recording/${selectedRecording.value.id}/download/transcript?template_id=${templateId}&format=${fmt}${translationParam}`
-                : `/recording/${selectedRecording.value.id}/download/transcript?format=${fmt}${translationParam}`;
+            const params = new URLSearchParams({ format: fmt });
+            if (templateId === 'none') params.set('raw', '1');
+            else if (templateId) params.set('template_id', templateId);
+            if (viewingTranslation.value) params.set('translation', '1');
+            const url = `/recording/${selectedRecording.value.id}/download/transcript?${params}`;
 
             const response = await fetch(url);
             if (!response.ok) {
@@ -1871,7 +1875,7 @@ export function useUI(state, utils, processedTranscription) {
         }
 
         try {
-            const fmt = transcriptDownloadFormat.value === 'md' ? 'md' : 'txt';
+            const fmt = normalizeTranscriptFormat(transcriptDownloadFormat.value);
             // The server applies the same default template and formatting to a
             // translation as it does to the transcription; the translation is
             // a JSON segment list too, so formatting it in the browser would

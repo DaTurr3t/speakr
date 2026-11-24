@@ -39,7 +39,7 @@ from src.services.transcription_defaults import (
 )
 from src.utils.dates import filter_day, filter_year_ok, to_utc_naive
 from src.utils.log_filters import loggable_error, loggable_locator
-from src.utils.transcript_render import BASIC_TEMPLATE_FORMAT, parse_segments, render_segments
+from src.utils.transcript_render import BASIC_TEMPLATE_FORMAT, parse_segments, render_segments, speaker_turns
 from src.services.speaker import (
     update_speaker_usage, apply_speaker_map, participants_from_segments, update_voice_profiles,
 )
@@ -47,8 +47,8 @@ from src.services.speaker import (
 # Incognito mode - disabled by default, enable via environment variable
 from src.services.document import (
     absolutize_markdown_links, add_document_header, append_conversation_turn,
-    docx_attachment_response, link_base_url, markdown_attachment_response,
-    new_document, process_markdown_to_docx,
+    PDF_MIMETYPE, docx_attachment_response, link_base_url, markdown_attachment_response,
+    new_document, process_markdown_to_docx, render_text_to_pdf, render_turns_to_pdf,
 )
 from src.services.llm import client, chat_client, call_chat_completion, process_streaming_with_thinking, TokenBudgetExceeded
 from src.services.embeddings import process_recording_chunks
@@ -125,9 +125,13 @@ def init_recordings_helpers(**kwargs):
 
 # --- Routes ---
 
+# Output formats of the transcript download; anything else is sent as 'txt'
+TRANSCRIPT_DOWNLOAD_FORMATS = ('txt', 'md', 'pdf')
+
+
 @recordings_bp.route('/recording/<int:recording_id>/download/transcript')
 @login_required
-@audit.access('recording.downloaded', details=lambda: {'part': 'transcript', 'format': audit.code(request.args.get('format'), ('txt', 'md'), 'txt')})
+@audit.access('recording.downloaded', details=lambda: {'part': 'transcript', 'format': audit.code(request.args.get('format'), TRANSCRIPT_DOWNLOAD_FORMATS, 'txt')})
 def download_transcript_with_template(recording_id):
     """Download transcript with custom template formatting."""
     try:
@@ -142,6 +146,11 @@ def download_transcript_with_template(recording_id):
 
         if not source_transcription:
             return jsonify(api_error('no_transcription_for_recording')), 400
+
+        # raw=1: every segment as "speaker: text", without a template (the
+        # "Download without template" choice; the browser builds TXT and MD
+        # itself and asks the server for the PDF).
+        raw = request.args.get('raw') in ('1', 'true', 'yes')
 
         # Get template ID from query params
         template_id = request.args.get('template_id', type=int)
@@ -164,22 +173,46 @@ def download_transcript_with_template(recording_id):
         is_diarized = segments is not None
         if not is_diarized:
             formatted_transcript = source_transcription
+        elif raw:
+            formatted_transcript = '\n'.join(
+                f"{segment.get('speaker') or 'Unknown'}: {segment.get('sentence') or ''}"
+                for segment in segments
+            )
         elif not template:
             # No template found: use a basic format
             formatted_transcript = render_segments(segments, BASIC_TEMPLATE_FORMAT)
         else:
             formatted_transcript = render_segments(segments, template.template, template.header)
 
-        # Output format: 'txt' (default) or 'md'. Markdown wraps the templated
-        # body with a title heading so it renders as a proper document, and
-        # swaps the extension + content-type. The transcript body itself is the
-        # same templated text in both cases (the template lines are valid
-        # markdown as-is).
+        # Output format: 'txt' (default), 'md' or 'pdf'. Markdown wraps the
+        # templated body with a title heading so it renders as a proper
+        # document, and swaps the extension + content-type. The transcript
+        # body itself is the same templated text for TXT and MD (the template
+        # lines are valid markdown as-is). The PDF of a diarized transcript is
+        # laid out as speaker turns (see below); a plain one is set as text.
         output_format = (request.args.get('format') or 'txt').lower()
-        if output_format not in ('txt', 'md'):
+        if output_format not in TRANSCRIPT_DOWNLOAD_FORMATS:
             output_format = 'txt'
 
-        if output_format == 'md':
+        if output_format == 'pdf' and is_diarized:
+            # Laid out as speaker turns: the speaker as a colored label where
+            # the speaker changes, the template line without its speaker part
+            # for each segment.
+            if raw:
+                line_format, header = '{{text}}', None
+            elif template:
+                line_format, header = template.template, template.header
+            else:
+                line_format, header = BASIC_TEMPLATE_FORMAT, None
+            response = make_response(render_turns_to_pdf(
+                recording.title or 'Transcript', speaker_turns(segments, line_format), header))
+            ext = 'pdf'
+            content_type = PDF_MIMETYPE
+        elif output_format == 'pdf':
+            response = make_response(render_text_to_pdf(recording.title or 'Transcript', formatted_transcript))
+            ext = 'pdf'
+            content_type = PDF_MIMETYPE
+        elif output_format == 'md':
             title = recording.title or 'Transcript'
             body = f"# {title}\n\n{formatted_transcript}\n"
             response = make_response(body)
@@ -191,7 +224,9 @@ def download_transcript_with_template(recording_id):
             content_type = 'text/plain; charset=utf-8'
 
         # Create response
-        if is_diarized and template:
+        if is_diarized and raw:
+            filename = f"{recording.title or 'transcript'}_raw.{ext}"
+        elif is_diarized and template:
             filename = f"{recording.title or 'transcript'}_{template.name}.{ext}"
         elif is_diarized:
             filename = f"{recording.title or 'transcript'}_formatted.{ext}"

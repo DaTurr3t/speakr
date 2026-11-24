@@ -39,7 +39,7 @@ The `|srt` filter drops the digits after the millisecond. The `|vtt` filter roun
 
 The optional **Header** field holds text that is written once at the top of the formatted transcript, followed by a blank line. The template itself is still applied to every segment. Placeholders in the header are not replaced, and trailing line breaks in it are ignored. With an empty header the output has no extra lines.
 
-The header applies to downloads, the auto-export and the API's `format=text`. It is not used for transcripts without speaker segments, which are returned as they are. In a Markdown download, the title heading comes first, then the header, then the segments.
+The header applies to downloads, the auto-export and the API's `format=text`. It is not used for transcripts without speaker segments, which are returned as they are. In a Markdown download, the title heading comes first, then the header, then the segments. In a PDF download, the recording title comes first, then the header, then the segments grouped by speaker: the speaker's name is shown once as a label where the speaker changes, and the `{{speaker}}` placeholder, with the brackets around it and the separator after it (such as `[{{speaker}}]: ` or `{{speaker|upper}} - `), is left out of each line.
 
 ## Creating Your First Template
 
