@@ -18,6 +18,10 @@ import {
     newJoinGroupId, MAX_JOIN_FILES,
 } from '../utils/upload-join.js';
 import { UPLOAD_ACCEPT, isAcceptedUploadFile, isVideoFileName } from '../utils/upload-file-type.js';
+import * as ServerSessions from '../db/server-recording-sessions.js';
+import {
+    failedUploadRecord, partitionByOwner, belongsTo, resurfaceAction, queueItemFromRecord, coveredByPendingUpload,
+} from '../utils/pending-uploads.js';
 
 export function useUpload(state, utils) {
     const {
@@ -914,6 +918,18 @@ export function useUpload(state, utils) {
                 }
             }
 
+            // The recording went up in one piece after its session on the
+            // server could not be finished (offline at Stop): that session
+            // holds a part of the same audio and is removed, so that it is not
+            // offered for recovery at the next start (#650).
+            if (fileItem.serverSessionId) {
+                try {
+                    await ServerSessions.discardSession(fileItem.serverSessionId);
+                } catch (sessionError) {
+                    console.warn('[Upload] Could not remove the server session of an uploaded recording:', sessionError);
+                }
+            }
+
             // Add to recordings list (a replayed retry may be listed already)
             if (!recordings.value.some(r => r.id === data.id)) {
                 recordings.value.unshift(data);
@@ -950,7 +966,9 @@ export function useUpload(state, utils) {
             // Not while the next recording is under way (#407): the upload can
             // finish minutes after the user started recording again, and
             // switching views then took them off the recorder.
-            if (fileItem.fromInProgressRecording && !recorderInUse(isRecording, currentView)) {
+            // An upload sent again after a reload (_resurfaced) leaves the
+            // person where they are.
+            if (fileItem.fromInProgressRecording && !fileItem._resurfaced && !recorderInUse(isRecording, currentView)) {
                 selectedRecording.value = data;
                 currentView.value = 'detail';
                 if (showUploadModal) showUploadModal.value = false;
@@ -1021,21 +1039,32 @@ export function useUpload(state, utils) {
                 //      mode, missing IndexedDB), fall back to a browser download
                 //      so the user keeps a local copy. Permanent audio loss is the
                 //      worst outcome, so both layers are best-effort.
+                //
+                // The record keeps the recording's crash-recovery start time,
+                // its server session and the account (#650); the queue item
+                // gets the record's id, so that a later success or failure of
+                // this item updates that record and no second one is written.
                 let persistedToIndexedDB = false;
                 try {
-                    await FailedUploads.storeFailedUpload({
-                        file: fileItem.file,
-                        fileName: fileItem.file.name,
-                        fileSize: fileItem.file.size,
-                        clientId: fileItem.clientId,
-                        notes: fileItem.notes,
-                        tags: fileItem.tags,
-                        asrOptions: fileItem.asrOptions,
-                        error: error.message
-                    });
+                    const failedUploadId = await FailedUploads.storeFailedUpload(
+                        failedUploadRecord(fileItem, error, currentUserId()));
                     persistedToIndexedDB = true;
+                    fileItem._failedUploadId = failedUploadId;
+                    fileItem._retryCount = 0;
                 } catch (dbError) {
                     console.warn('[Upload] IndexedDB persistence failed for failed upload:', dbError);
+                }
+
+                // The record now holds the whole recording. The crash-recovery
+                // copy of the same recording (the chunks saved while it was
+                // recorded) would be offered as a second recording at the next
+                // start, beside the upload of the record: it goes.
+                if (persistedToIndexedDB && fileItem.recordingSessionStartTime) {
+                    try {
+                        await RecordingDB.clearRecordingSessionIfStartedAt(fileItem.recordingSessionStartTime);
+                    } catch (dbError) {
+                        console.warn('[Upload] Could not clear the crash-recovery copy of a saved upload:', dbError);
+                    }
                 }
 
                 if (persistedToIndexedDB) {
@@ -1139,10 +1168,11 @@ export function useUpload(state, utils) {
         ).filter(Boolean);
 
         const firstTag = selectedTagsObjects[0];
+        // Apply language from first tag (works for all connectors; speaker counts need diarization)
+        if (firstTag && firstTag.default_language) {
+            uploadLanguage.value = firstTag.default_language;
+        }
         if (firstTag && connectorSupportsDiarization.value) {
-            if (firstTag.default_language) {
-                uploadLanguage.value = firstTag.default_language;
-            }
             if (firstTag.default_min_speakers) {
                 uploadMinSpeakers.value = firstTag.default_min_speakers;
             }
@@ -1400,20 +1430,103 @@ export function useUpload(state, utils) {
         return true;
     };
 
+    // The account signed in on this page (#app data-current-user-id).
+    const currentUserId = () => {
+        if (utils.currentUserId) return String(utils.currentUserId() || '');
+        try {
+            const el = typeof document !== 'undefined' ? document.getElementById('app') : null;
+            return (el && el.dataset && el.dataset.currentUserId) || '';
+        } catch (e) {
+            return '';
+        }
+    };
+
+    // A browser shared by several accounts, or a session that ended without
+    // a sign-out (the sign-out deletes every copy): what waits in this
+    // browser for another account is deleted, never uploaded to this one,
+    // and the person is told how many (#650). That is the failed-upload
+    // records, the crash-recovery copy and the remembered server session of
+    // that account. Copies saved by a release before this rule have no
+    // account and are left as they were.
+    // Resolved when the app's loading overlay (loading.js) is gone, or after 12 s.
+    const pageShown = () => new Promise((resolve) => {
+        if (typeof document === 'undefined' || !document.documentElement) { resolve(); return; }
+        const started = Date.now();
+        const look = () => {
+            if (!document.documentElement.classList.contains('app-loading') || Date.now() - started > 12000) resolve();
+            else setTimeout(look, 200);
+        };
+        look();
+    });
+
+    let _removing = null;
+    const removeOtherAccountsCopies = () => {
+        if (!_removing) _removing = (async () => {
+            const me = currentUserId();
+            if (!me) return 0;
+            let removed = 0;
+            try {
+                const failed = await FailedUploads.getFailedUploads();
+                for (const record of partitionByOwner(failed, me).others) {
+                    try {
+                        await FailedUploads.deleteFailedUpload(record.id);
+                        removed++;
+                    } catch (e) {
+                        console.warn('[Upload] Could not delete a record of another account:', e);
+                    }
+                }
+            } catch (e) {
+                console.warn('[Upload] Could not read the records of other accounts:', e);
+            }
+            try {
+                const session = await RecordingDB.checkForRecoverableRecording();
+                if (session && session.ownerId && !belongsTo(session, me)) {
+                    await RecordingDB.clearRecordingSessionIfStartedAt(session.startTime);
+                    removed++;
+                }
+            } catch (e) {
+                console.warn('[Upload] Could not check the crash-recovery copy:', e);
+            }
+            try {
+                const remembered = ServerSessions.getRememberedSession();
+                if (remembered && remembered.owner_id && !belongsTo({ ownerId: remembered.owner_id }, me)) {
+                    // A session of another account cannot be deleted from this
+                    // one (the server answers 404); its pointer is forgotten and
+                    // the server removes the session when it expires.
+                    ServerSessions.forgetActiveSession();
+                    removed++;
+                }
+            } catch (e) {
+                console.warn('[Upload] Could not check the remembered server session:', e);
+            }
+            if (removed > 0) {
+                // Shown once the loading overlay is gone, so that it is seen.
+                pageShown().then(() => showToast?.(removed === 1
+                    ? t('upload.otherAccountCopiesDeletedOne')
+                    : t('upload.otherAccountCopiesDeleted', { count: removed }), 'fa-trash', 8000));
+            }
+            return removed;
+        })().finally(() => { _removing = null; });
+        return _removing;
+    };
+
     // Auto-retry path for #313: read the failed uploads persisted in IndexedDB,
     // rebuild a File for each, and resubmit them through the normal upload queue
     // (correct CSRF, visible in the Processing Queue, works in every browser —
     // no Background Sync). Triggered on page load and on the browser `online`
     // event. Items are removed from IndexedDB on success and retry-counted on
-    // failure (see uploadSingleFile).
+    // failure (see uploadSingleFile). The recordings made on the offline
+    // recorder page (offline-recorder.html) are records of the same store.
     const resurfaceFailedUploads = async () => {
         if (_isResurfacing) return;
         if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
         _isResurfacing = true;
         try {
+            await removeOtherAccountsCopies();
             const failed = await FailedUploads.getFailedUploads();
+            const split = partitionByOwner(failed, currentUserId());
             let queued = 0;
-            for (const rec of failed) {
+            for (const rec of split.mine) {
                 if (!rec || !rec.fileData) continue;
                 if ((rec.retryCount || 0) >= MAX_AUTO_RETRIES) {
                     // Records that hit the cap before this hand-off existed (or
@@ -1427,32 +1540,19 @@ export function useUpload(state, utils) {
                 }
 
                 // Skip if this upload is already represented in the queue and
-                // actively in flight; otherwise drop a stale failed item so we
-                // don't show duplicates.
-                const existingIdx = uploadQueue.value.findIndex(i => i.clientId === rec.clientId);
-                if (existingIdx !== -1) {
-                    const st = uploadQueue.value[existingIdx].status;
-                    if (['uploading', 'pending', 'ready', 'queued'].includes(st)) continue;
-                    uploadQueue.value.splice(existingIdx, 1);
+                // waits or is in flight; replace a failed item of the same
+                // upload so it is neither shown nor sent twice.
+                const action = resurfaceAction(rec, uploadQueue.value);
+                if (action === 'skip') continue;
+                if (action === 'replace') {
+                    uploadQueue.value = uploadQueue.value.filter(i => i.clientId !== rec.clientId);
                 }
 
                 const file = new File([rec.fileData], rec.fileName || `speakr-recording-${Date.now()}.webm`,
                     { type: rec.mimeType || 'audio/webm' });
-                uploadQueue.value.push({
-                    file: markRaw ? markRaw(file) : file,
-                    notes: rec.notes || '',
-                    tags: rec.tags || [],
-                    asrOptions: rec.asrOptions || {},
-                    status: 'ready',          // picked up by startProcessingQueue (skips startUpload's UI-state overwrite)
-                    recordingId: null,
-                    clientId: rec.clientId,
-                    error: null,
-                    duration: null,
-                    willAutoSummarize: false,
-                    preserveOptions: true,    // keep the stored tags/ASR, don't clobber with current UI state
-                    _failedUploadId: rec.id,
-                    _retryCount: rec.retryCount || 0,
-                });
+                // status 'ready': picked up by startProcessingQueue (skips
+                // startUpload's UI-state overwrite).
+                uploadQueue.value.push(queueItemFromRecord(rec, markRaw ? markRaw(file) : file));
                 queued++;
             }
             if (queued > 0) {
@@ -1466,6 +1566,21 @@ export function useUpload(state, utils) {
             console.warn('[Upload] resurfaceFailedUploads failed:', e);
         } finally {
             _isResurfacing = false;
+        }
+    };
+
+    /**
+     * Whether a copy that the recovery check would offer (the local
+     * crash-recovery session with this start time, or the server session
+     * with this id) is held by a record that waits for its upload (#650).
+     * Such a copy is not offered: the record is uploaded instead.
+     */
+    const pendingUploadCovers = async ({ startTime = null, sessionId = null } = {}) => {
+        try {
+            const failed = await FailedUploads.getFailedUploads();
+            return coveredByPendingUpload(partitionByOwner(failed, currentUserId()).mine, { startTime, sessionId });
+        } catch (e) {
+            return false;
         }
     };
 
@@ -1485,6 +1600,8 @@ export function useUpload(state, utils) {
         handleJoinDrop,
         handleJoinDragEnd,
         resurfaceFailedUploads,
+        pendingUploadCovers,
+        removeOtherAccountsCopies,
         handleDragOver,
         handleDragLeave,
         handleDrop,

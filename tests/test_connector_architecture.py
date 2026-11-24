@@ -9,6 +9,7 @@ This script tests:
 4. Chunking logic (connector-aware)
 5. Codec handling per connector
 6. Request/Response data types
+7. gpt-transcribe request parameters, pricing and auto-detection
 
 Run with: docker exec speakr-dev python /app/tests/test_connector_architecture.py
 """
@@ -47,6 +48,25 @@ def run_test(name, func):
         ERRORS.append((name, f"Exception: {e}"))
         if "pytest" in sys.modules:
             raise
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _restore_environment():
+    """The tests here clear transcription settings from os.environ and
+    rebuild the connector registry. Both are put back afterwards, so later
+    tests in the same process keep the settings conftest.py made."""
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+    from src.services.transcription import registry
+    registry._registry = None
+    registry.ConnectorRegistry._instance = None
+    registry.ConnectorRegistry._initialized = False
+    registry.ConnectorRegistry._active_connector = None
 
 
 def clear_env():
@@ -215,6 +235,16 @@ def test_auto_detection():
         registry.initialize_from_env()
         assert registry.get_active_connector_name() == 'openai_whisper'
     run_test("Default falls back to openai_whisper", t7)
+
+    def t8():
+        clear_env()
+        reset_registry()
+        os.environ['TRANSCRIPTION_API_KEY'] = 'test-key'
+        os.environ['TRANSCRIPTION_MODEL'] = 'gpt-transcribe'
+        registry = get_registry()
+        registry.initialize_from_env()
+        assert registry.get_active_connector_name() == 'openai_transcribe'
+    run_test("gpt-transcribe model auto-detects openai_transcribe", t8)
 
 
 # =============================================================================
@@ -565,6 +595,47 @@ def test_edge_cases():
 
 
 # =============================================================================
+# TEST SECTION 9: gpt-transcribe Request Parameters
+# =============================================================================
+
+def test_gpt_transcribe():
+    """Test the request parameters and price of gpt-transcribe."""
+    print("\n=== Testing gpt-transcribe ===")
+
+    from unittest.mock import MagicMock
+    from src.services.transcription.base import TranscriptionRequest
+    from src.services.transcription.connectors.openai_transcribe import OpenAITranscribeConnector
+    from src.services.transcription_tracking import get_transcription_cost_per_minute
+
+    def create_params(model):
+        connector = OpenAITranscribeConnector({'api_key': 'test', 'model': model})
+        connector.client = MagicMock()
+        connector.client.audio.transcriptions.create.return_value = MagicMock(spec=['text'], text='hello')
+        connector.transcribe(TranscriptionRequest(
+            audio_file=io.BytesIO(b'audio'), filename='a.mp3', language='cs',
+            hotwords='A, B, <bad>, B', prompt='P'))
+        return connector.client.audio.transcriptions.create.call_args.kwargs
+
+    def t1():
+        params = create_params('gpt-transcribe')
+        assert params['languages'] == ['cs']
+        assert params['keywords'] == ['A', 'B']
+        assert params['prompt'] == 'P'
+        assert 'language' not in params
+    run_test("gpt-transcribe sends languages, keywords and prompt", t1)
+
+    def t2():
+        params = create_params('gpt-4o-transcribe')
+        assert params['language'] == 'cs'
+        assert params['prompt'] == 'P. A, B, <bad>, B'
+    run_test("gpt-4o-transcribe still sends language and the combined prompt", t2)
+
+    def t3():
+        assert get_transcription_cost_per_minute('openai_transcribe', 'gpt-transcribe') == 0.0045
+    run_test("gpt-transcribe costs $0.0045/min", t3)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -584,6 +655,7 @@ def main():
     test_connector_capabilities()
     test_registry_operations()
     test_edge_cases()
+    test_gpt_transcribe()
 
     print("\n" + "=" * 60)
     print(f"RESULTS: {PASSED} passed, {FAILED} failed")

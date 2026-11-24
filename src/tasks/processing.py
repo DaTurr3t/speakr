@@ -23,7 +23,8 @@ from openai import OpenAI
 from src.services.llm_settings import get_temperature
 from src.database import db
 from src.models import Recording, Tag, Event, TranscriptChunk, SystemSetting, GroupMembership, RecordingTag, InternalShare, SharedRecordingState, User, NamingTemplate
-from src.services.llm import is_using_openai_api, call_llm_completion, format_api_error_message, TEXT_MODEL_NAME, client, http_client_no_proxy, TokenBudgetExceeded
+from src.services.llm import is_using_openai_api, call_llm_completion, format_api_error_message, http_client_no_proxy, TokenBudgetExceeded
+from src.services import llm_config
 from src.utils import extract_json_object, safe_json_loads
 from src.utils.ffprobe import get_codec_info, is_video_file, is_lossless_audio, FFProbeError, has_audio_stream, probe_rejected_input
 from src.utils.ffmpeg_utils import convert_to_mp3, extract_audio_from_video as ffmpeg_extract_audio, compress_audio, FFmpegError, FFmpegNotFoundError, FFmpegTimeoutError, AUDIO_DECODE_FAILED_MESSAGE
@@ -79,18 +80,15 @@ from src.services import job_control
 # Default off so existing deployments and prompt-quality behaviour are unchanged
 # unless explicitly opted in. Scope is the title, summary, translation and
 # contextual speaker-identification prompts.
-PREFIX_CACHE_OPTIMIZED_PROMPTS = os.environ.get(
-    'PREFIX_CACHE_OPTIMIZED_PROMPTS', 'false'
-).lower() == 'true'
-
+#
 # Anthropic models (directly or through OpenRouter) cache only up to an
-# explicit cache_control breakpoint (#488). With this on, the shared prefix is
-# sent as its own text part carrying the breakpoint; the text is unchanged, so
-# automatic prefix caching elsewhere still applies. Only used together with
-# PREFIX_CACHE_OPTIMIZED_PROMPTS.
-TEXT_MODEL_CACHE_BREAKPOINTS = os.environ.get(
-    'TEXT_MODEL_CACHE_BREAKPOINTS', 'false'
-).lower() == 'true'
+# explicit cache_control breakpoint (#488). With TEXT_MODEL_CACHE_BREAKPOINTS
+# on, the shared prefix is sent as its own text part carrying the breakpoint;
+# the text is unchanged, so automatic prefix caching elsewhere still applies.
+# Only used together with PREFIX_CACHE_OPTIMIZED_PROMPTS.
+#
+# Both are hot settings (see _SYSTEM_SETTING_MAP below) and are read through
+# the module attribute, so a saved value applies to the next prompt.
 
 
 def prefix_cache_flags():
@@ -100,7 +98,8 @@ def prefix_cache_flags():
     must see the current values, so the flags are read when a prompt is built,
     not captured at import. Every prompt-building site reads them here.
     """
-    return PREFIX_CACHE_OPTIMIZED_PROMPTS, TEXT_MODEL_CACHE_BREAKPOINTS
+    return (bool(_self.PREFIX_CACHE_OPTIMIZED_PROMPTS),
+            bool(_self.TEXT_MODEL_CACHE_BREAKPOINTS))
 
 
 # Longest notes text given to the summarizer (#440)
@@ -349,7 +348,7 @@ def finish_processing(recording_id, events_transcript=None, events_summary=None,
     loaded_created_at = recording.created_at
     from src.utils.error_formatting import is_transcription_error
     owner = recording.owner
-    if (extract_events and owner and owner.extract_events and client is not None and recording.transcription
+    if (extract_events and owner and owner.extract_events and llm_config.is_configured('text') and recording.transcription
             and len(recording.transcription.strip()) >= 10 and not is_transcription_error(recording.transcription)):
         transcript = events_transcript or format_transcription_for_llm(recording.transcription)
         extract_events_from_transcript(recording_id, transcript, events_summary or "")
@@ -383,6 +382,85 @@ def queue_inquire_chunks(recording_id):
     recording = db.session.get(Recording, recording_id)
     if recording:
         job_queue.enqueue(recording.user_id, recording_id, 'index_chunks')
+
+
+def _auto_summary_decision(recording):
+    """(whether a summary follows the transcript, the reason when none does).
+
+    The admin setting and the owner's preference can turn it off, and without
+    an LLM client there is no summary step: the title step finishes the
+    recording then (it stayed PROCESSING before, #412).
+    """
+    admin_setting = SystemSetting.get_setting('disable_auto_summarization', False)
+    admin_disabled = admin_setting if isinstance(admin_setting, bool) else str(admin_setting).lower() == 'true'
+    if admin_disabled:
+        return False, "admin setting"
+    user = db.session.get(User, recording.user_id) if recording.user_id else None
+    if user and user.auto_summarization is False:
+        return False, "user preference"
+    if not llm_config.is_configured('text'):
+        return False, "no LLM client"
+    return True, None
+
+
+def queue_auto_summary(recording_id):
+    """Queue the summary that follows a transcript, on the summary workers (D#663).
+
+    The job is marked after_transcription: it ends the processing of the
+    recording (COMPLETED, the transcription notices, events, export and
+    auto-shares), and its failure leaves the recording COMPLETED with the
+    transcript. The queue sets the recording SUMMARIZING. Returns
+    SUMMARY_QUEUED, which the transcription job hands to the queue.
+    """
+    from src.services.job_queue import job_queue, SUMMARY_QUEUED, AUTO_SUMMARY_PARAMS
+
+    recording = db.session.get(Recording, recording_id)
+    # No write of this session may be open while the queue's own session
+    # writes the job (SQLite has one writer).
+    db.session.commit()
+    job_queue.enqueue(recording.user_id, recording_id, 'summarize', params=dict(AUTO_SUMMARY_PARAMS))
+    return SUMMARY_QUEUED
+
+
+def _finish_after_post_transcript_failure(recording_id, will_auto_summarize, summary_outcome):
+    """Finish a recording whose transcript is stored after a later step failed (#684).
+
+    The summary is queued when one should follow and is not queued yet;
+    otherwise the steps after COMPLETED run, without the event extraction
+    (an LLM call that may be what failed). A recording that is COMPLETED
+    already is left as it is. Never raises: the transcription job completes.
+    """
+    if summary_outcome is not None:
+        return summary_outcome
+    try:
+        db.session.rollback()
+        recording = db.session.get(Recording, recording_id)
+        if recording is None or recording.status in ('COMPLETED', 'SUMMARIZING'):
+            return None
+        if will_auto_summarize is None:
+            will_auto_summarize = _auto_summary_decision(recording)[0]
+        if will_auto_summarize:
+            return queue_auto_summary(recording_id)
+        finish_processing(recording_id, extract_events=False)
+        return None
+    except Exception as e:
+        log_failure(current_app.logger, logging.ERROR,
+                    f"Could not finish recording {recording_id} after a failed step; marking it completed", e)
+    try:
+        db.session.rollback()
+        recording = db.session.get(Recording, recording_id)
+        if recording is not None and recording.status not in ('COMPLETED', 'SUMMARIZING'):
+            recording.status = 'COMPLETED'
+            recording.completed_at = datetime.utcnow()
+            db.session.commit()
+    except Exception as e:
+        log_failure(current_app.logger, logging.ERROR,
+                    f"Could not mark recording {recording_id} completed after a failed step", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+    return None
 
 
 def generate_title_task(app_context, recording_id, will_auto_summarize=False):
@@ -628,7 +706,7 @@ def _generate_ai_title(recording):
 
 
 def generate_summary_only_task(app_context, recording_id, custom_prompt_override=None, custom_prompt_append=False,
-                               user_id=None, prompt_used=None):
+                               user_id=None, prompt_used=None, after_transcription=False):
     """Generates only a summary for a recording (no title, no JSON response).
 
     Args:
@@ -644,6 +722,9 @@ def generate_summary_only_task(app_context, recording_id, custom_prompt_override
         prompt_used: {'prompt', 'source', 'name'} to store as the prompt of this
             summary (reprocessing.summary_prompt_used). Without it the prompt
             that runs is stored, before the appended text and the variables.
+        after_transcription: the summary that follows a transcript (D#663).
+            A failure leaves the recording SUMMARIZING for the job queue,
+            which retries it or finishes the recording COMPLETED.
     """
     with app_context:
         recording = db.session.get(Recording, recording_id)
@@ -652,7 +733,7 @@ def generate_summary_only_task(app_context, recording_id, custom_prompt_override
             return
         loaded_created_at = recording.created_at
 
-        if client is None:
+        if not llm_config.is_configured('text'):
             current_app.logger.warning(f"Skipping summary generation for {recording_id}: OpenRouter client not configured.")
             recording.summary = "[Summary skipped: OpenRouter client not configured]"
             recording.clear_summary_prompt_used()
@@ -669,7 +750,7 @@ def generate_summary_only_task(app_context, recording_id, custom_prompt_override
         db.session.commit()
         job_control.current().stage('summarizing')
 
-        current_app.logger.info(f"Requesting summary from OpenRouter for recording {recording_id} using model {TEXT_MODEL_NAME}...")
+        current_app.logger.info(f"Requesting summary from OpenRouter for recording {recording_id} using model {llm_config.resolve_config('text')['model_name']}...")
 
         if not recording.transcription or len(recording.transcription.strip()) < 10:
             current_app.logger.warning(f"Transcription for recording {recording_id} is too short or empty. Skipping summarization.")
@@ -913,14 +994,15 @@ def generate_summary_only_task(app_context, recording_id, custom_prompt_override
                             f"Error generating summary for recording {recording_id}", e)
             recording.summary = error_msg
             recording.clear_summary_prompt_used()
-            recording.status = 'FAILED'
+            if not after_transcription:
+                recording.status = 'FAILED'
             recording.error_message = sanitize_error_message(error_msg)
             db.session.commit()
             # The caller owns the outcome (#583). The job queue marks the job
             # failed (or re-queues a transient error) and sends
-            # recording.summary.failed once the failure is final; the
-            # auto-summary inside transcription catches this and keeps the
-            # transcription job completed.
+            # recording.summary.failed once the failure is final; for the
+            # summary after a transcript it finishes the recording COMPLETED
+            # (D#663).
             from src.services.error_classification import SummaryStepFailed
             raise SummaryStepFailed(str(e), stored_summary=error_msg) from e
 
@@ -1910,6 +1992,11 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
         # recording so re-processing/reprocess honours it too.
         effective_video_retention = _self.VIDEO_RETENTION and not getattr(recording, 'keep_audio_only', False)
 
+        # Once the transcript is committed, no later step may fail or retry
+        # the job: a retry would run the transcription again (#684).
+        transcript_stored = False
+        will_auto_summarize = None
+        summary_outcome = None
         try:
             current_app.logger.info(f"Starting connector-based transcription for recording {recording_id}...")
             recording.status = 'PROCESSING'
@@ -2435,6 +2522,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             recording.transcription_duration_seconds = int(transcription_end_time - transcription_start_time)
 
             db.session.commit()
+            transcript_stored = True
             current_app.logger.info(f"Transcription completed in {recording.transcription_duration_seconds}s")
 
             # Record transcription usage for billing/budgeting
@@ -2521,15 +2609,7 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
                         # fails the transcription.
                         current_app.logger.warning(f"Failed to apply contextual speaker labelling: {auto_label_err}")
 
-            # Check if auto-summarization is disabled (admin setting or user preference)
-            admin_setting = SystemSetting.get_setting('disable_auto_summarization', False)
-            admin_disabled = admin_setting if isinstance(admin_setting, bool) else str(admin_setting).lower() == 'true'
-            user = db.session.get(User, recording.user_id)
-            user_disabled = user and user.auto_summarization is False
-            # Without an LLM client there is no summary step: the title step
-            # finishes the recording (it stayed PROCESSING before, #412).
-            no_client = client is None
-            will_auto_summarize = not admin_disabled and not user_disabled and not no_client
+            will_auto_summarize, reason = _auto_summary_decision(recording)
 
             # Generate title immediately. A cancel from here on keeps the
             # transcript, which is complete, and skips the title and the summary.
@@ -2545,25 +2625,16 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             if not will_auto_summarize:
                 # generate_title_task has already finished the recording
                 # (finish_processing: status, auto-shares, export, Inquire chunks).
-                reason = "admin setting" if admin_disabled else ("user preference" if user_disabled else "no LLM client")
                 current_app.logger.info(f"Auto-summarization disabled ({reason}), skipping summary for recording {recording_id}")
             else:
-                # Auto-generate summary for all recordings
-                current_app.logger.info(f"Auto-generating summary for recording {recording_id}")
-                from src.services.error_classification import SummaryStepFailed
+                # The summary is a job of its own on the summary workers
+                # (D#663): this worker is free for the next transcription.
+                # The recording stays SUMMARIZING, its transcript readable,
+                # until that job has finished it.
                 _stop_if_recording_replaced(recording_id, loaded_created_at)
                 job.check_cancel()
-                try:
-                    generate_summary_only_task(app_context, recording_id)
-                except SummaryStepFailed as summary_err:
-                    # The transcript is saved, so the transcription job still
-                    # completes; the recording stays FAILED with the summary
-                    # error, and a summary reprocess recovers it (#583).
-                    log_failure(current_app.logger, logging.ERROR,
-                                f"Auto-summary failed for recording {recording_id}; transcript kept", summary_err)
-                    from src.services.webhook_dispatch import emit_summary_result
-                    emit_summary_result(db.session.get(Recording, recording_id), ok=False,
-                                        error=summary_err.stored_summary)
+                summary_outcome = queue_auto_summary(recording_id)
+                current_app.logger.info(f"Summary of recording {recording_id} queued on the summary workers")
 
             # Auto-translation: admin setting prevails over the user preference.
             # Both must allow it; the recording status stays untouched.
@@ -2600,6 +2671,8 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             except Exception as auto_translate_err:
                 current_app.logger.warning(f"Auto-translation trigger failed for recording {recording_id}: {auto_translate_err}")
 
+            return summary_outcome
+
         except job_control.JobCanceled:
             # Not a failure: nothing pending is written, the derived temp
             # files go, and the job queue puts the recording back.
@@ -2608,17 +2681,36 @@ def transcribe_with_connector(app_context, recording_id, filepath, original_file
             current_app.logger.info(f"Transcription of recording {recording_id} stopped: its job was canceled")
             raise
         except Exception as e:
-            db.session.rollback()
-            if isinstance(e, RecordingDeletedDuringJob) or _recording_deleted(recording_id, loaded_created_at):
+            try:
+                db.session.rollback()
+                deleted = isinstance(e, RecordingDeletedDuringJob) or _recording_deleted(recording_id, loaded_created_at)
+            except Exception:
+                if not transcript_stored:
+                    raise
+                deleted = False
+            if deleted:
                 # Not a failure: the runner drops the job (#531).
                 current_app.logger.info(f"Recording {recording_id} was deleted during transcription; stopping")
                 raise
+            if transcript_stored:
+                # A step after the transcript failed (a database timeout in
+                # the title step, for example). A retry would transcribe the
+                # audio again, so the job completes and the recording is
+                # finished as far as it can be (#684).
+                _remove_derived_temp_files(filepath, locals().get('converted_filepath'), locals().get('audio_filepath'))
+                log_failure(current_app.logger, logging.ERROR,
+                            f"A step after the transcript failed for recording {recording_id}; "
+                            f"the transcript is kept and not transcribed again", e, traceback=True)
+                return _finish_after_post_transcript_failure(recording_id, will_auto_summarize, summary_outcome)
             error_msg = str(e)
             error_type = type(e).__name__
             log_failure(current_app.logger, logging.ERROR,
                         f"Connector transcription FAILED for recording {recording_id}", e, traceback=True)
 
-            # Handle timeout errors specifically - log the configured timeout for debugging
+            # Handle timeout errors specifically - log the configured timeout
+            # for debugging. Only reached before the transcript was stored, so
+            # a later timeout (database, LLM) is not reported as one of the
+            # transcription connector (#684).
             if "timed out" in error_msg.lower() or "timeout" in error_msg.lower() or "Timeout" in error_type:
                 try:
                     from src.services.transcription import get_registry
@@ -2708,7 +2800,9 @@ def transcribe_audio_task(app_context, recording_id, filepath, filename_for_asr,
     # After transcription completes, calculate processing time
     with app_context:
         recording = db.session.get(Recording, recording_id)
-        if recording and recording.status in ['COMPLETED', 'FAILED']:
+        # SUMMARIZING: the summary was handed to a job of its own (D#663),
+        # and this is the time of the transcription job.
+        if recording and recording.status in ['COMPLETED', 'FAILED', 'SUMMARIZING']:
             end_time = datetime.utcnow()
             recording.processing_time_seconds = (end_time - start_time).total_seconds()
             db.session.commit()
@@ -3041,7 +3135,7 @@ def _record_incognito_transcription_usage(user, connector, audio_path, duration_
 
 def _generate_incognito_title(transcription_text, user=None):
     """Generate a title for incognito recording without database storage."""
-    if not client:
+    if not llm_config.is_configured('text'):
         return "Incognito Recording"
 
     try:
@@ -3097,7 +3191,7 @@ def generate_incognito_summary(transcription_text, user=None):
 
     Raises TokenBudgetExceeded when the user's monthly token budget is used up.
     """
-    if not client:
+    if not llm_config.is_configured('text'):
         return None
 
     try:
@@ -3203,6 +3297,10 @@ def translate_transcription_task(app_context, recording_id, user_id=None, target
 from src.utils.system_settings import apply_hot_settings
 _SYSTEM_SETTING_MAP = {
     "ENABLE_INTERNAL_SHARING": ("enable_internal_sharing", "ENABLE_INTERNAL_SHARING", False),
+    "PREFIX_CACHE_OPTIMIZED_PROMPTS": (
+        "prefix_cache_optimized_prompts", "PREFIX_CACHE_OPTIMIZED_PROMPTS", False),
+    "TEXT_MODEL_CACHE_BREAKPOINTS": (
+        "text_model_cache_breakpoints", "TEXT_MODEL_CACHE_BREAKPOINTS", False),
     "VIDEO_RETENTION": ("video_retention", "VIDEO_RETENTION", False),
     "VIDEO_PASSTHROUGH_ASR": ("video_passthrough_asr", "VIDEO_PASSTHROUGH_ASR", False),
 }

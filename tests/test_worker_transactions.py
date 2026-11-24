@@ -88,7 +88,7 @@ def _run(rid, connector):
     with patch("src.services.transcription.get_connector", return_value=connector), \
          patch.object(proc, "is_video_file", return_value=False), \
          patch.object(proc, "convert_if_needed", return_value=conv), \
-         patch.object(proc, "client", MagicMock()), \
+         patch.object(proc.llm_config, "is_configured", return_value=True), \
          patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
          patch.object(proc, "generate_title_task") as title, \
          patch.object(proc, "generate_summary_only_task") as summary, \
@@ -132,7 +132,7 @@ def test_no_transaction_is_open_during_the_summary_llm_call(ctx):
         completion.choices[0].message.reasoning = None
         return completion
 
-    with patch.object(proc, "client", MagicMock()), \
+    with patch.object(proc.llm_config, "is_configured", return_value=True), \
          patch.object(proc, "call_llm_completion", side_effect=fake_llm), \
          patch.object(proc, "ENABLE_INQUIRE_MODE", False):
         proc.generate_summary_only_task(app.app_context(), rec.id)
@@ -255,7 +255,7 @@ def test_a_completed_transcription_returns_no_failure(ctx):
     with patch("src.services.transcription.get_connector", return_value=connector), \
          patch.object(proc, "is_video_file", return_value=False), \
          patch.object(proc, "convert_if_needed", return_value=conv), \
-         patch.object(proc, "client", MagicMock()), \
+         patch.object(proc.llm_config, "is_configured", return_value=True), \
          patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
          patch.object(proc, "generate_title_task"), \
          patch.object(proc, "generate_summary_only_task"), \
@@ -264,4 +264,9 @@ def test_a_completed_transcription_returns_no_failure(ctx):
         chunking.get_audio_duration.return_value = 60.0
         outcome = proc.transcribe_with_connector(app.app_context(), rec.id, path, "w.mp3",
                                                  time.time(), mime_type="audio/mpeg")
-    assert outcome is None
+    # No failure: the summary was handed to a job of its own (D#663).
+    from src.services.job_queue import SUMMARY_QUEUED
+    from src.models import ProcessingJob
+    assert outcome is SUMMARY_QUEUED
+    ProcessingJob.query.filter_by(recording_id=rec.id).delete()
+    db.session.commit()

@@ -2,6 +2,7 @@
 OpenAI GPT-4o Transcribe connector.
 
 Supports the newer GPT-4o based transcription models:
+- gpt-transcribe: Newer transcription model with a dedicated keywords list
 - gpt-4o-transcribe: High quality transcription
 - gpt-4o-mini-transcribe: Cost-effective transcription
 - gpt-4o-transcribe-diarize: Speaker diarization with labels A, B, C, D
@@ -33,10 +34,13 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
     CAPABILITIES: Set[TranscriptionCapability] = {
         TranscriptionCapability.TIMESTAMPS,
         TranscriptionCapability.LANGUAGE_DETECTION,
+        TranscriptionCapability.LANGUAGE_SELECTION,
         # Hotwords + initial_prompt are concatenated into OpenAI's free-text
         # `prompt` parameter for non-diarize models. The diarize model
         # (gpt-4o-transcribe-diarize) silently ignores both -- handled with
         # a UI help note rather than a per-model capability split.
+        # gpt-transcribe takes hotwords as the `keywords` list instead, and the
+        # initial prompt as `prompt`.
         TranscriptionCapability.HOTWORDS,
         TranscriptionCapability.INITIAL_PROMPT,
     }
@@ -45,7 +49,7 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
     # GPT-4o Transcribe models have specific constraints
     # - 25MB file size limit (all models)
     # - Duration limits vary by model:
-    #   - gpt-4o-transcribe / gpt-4o-mini-transcribe: 1500 seconds (25 min)
+    #   - gpt-transcribe / gpt-4o-transcribe / gpt-4o-mini-transcribe: 1500 seconds (25 min)
     #   - gpt-4o-transcribe-diarize: 1400 seconds (~23 min)
     # - chunking_strategy="auto" handles files internally up to the duration limit
     # Supported formats: mp3, mp4, mpeg, mpga, m4a, wav, webm, flac, ogg, oga
@@ -64,6 +68,12 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
 
     # Models and their capabilities with duration limits
     MODELS = {
+        'gpt-transcribe': {
+            'supports_diarization': False,
+            'max_duration_seconds': 1500,  # 25 minutes
+            'recommended_chunk_seconds': 1200,  # 20 minutes
+            'description': 'Newer transcription model with a dedicated keywords list'
+        },
         'gpt-4o-transcribe': {
             'supports_diarization': False,
             'max_duration_seconds': 1500,  # 25 minutes
@@ -108,7 +118,8 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
                 - http_client: Optional httpx.Client instance
         """
         # Store model before calling super().__init__ since _validate_config needs it
-        self.model = config.get('model', 'gpt-4o-transcribe')
+        # OpenAI's model names are lower case; 'GPT-Transcribe' is the same model
+        self.model = (config.get('model') or 'gpt-4o-transcribe').strip().lower()
 
         # Set model-specific specifications (override class defaults)
         # Use SPECIFICATIONS (uppercase) to shadow the class attribute
@@ -153,7 +164,7 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
         if not self.config.get('api_key'):
             raise ConfigurationError("api_key is required for OpenAI Transcribe connector")
 
-        model = self.config.get('model', 'gpt-4o-transcribe')
+        model = self.model
         if model not in self.MODELS:
             raise ConfigurationError(
                 f"Unknown model: {model}. Valid models: {list(self.MODELS.keys())}"
@@ -166,7 +177,7 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
 
     def transcribe(self, request: TranscriptionRequest) -> TranscriptionResponse:
         """
-        Transcribe audio using GPT-4o Transcribe API.
+        Transcribe audio using the OpenAI Transcribe API.
 
         Args:
             request: Standardized transcription request
@@ -190,7 +201,11 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
             }
 
             if request.language:
-                params["language"] = request.language
+                if effective_model == 'gpt-transcribe':
+                    # gpt-transcribe takes a list of possible languages, not `language`
+                    params["languages"] = [request.language]
+                else:
+                    params["language"] = request.language
                 logger.info(f"Using transcription language: {request.language}")
 
             # Handle diarization model specifics
@@ -223,6 +238,20 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
                             }
                             logger.info(f"Using known speaker references for {len(speaker_names)} speakers")
                             logger.debug(f"Known speaker names: {speaker_names}")
+            elif effective_model == 'gpt-transcribe':
+                # gpt-transcribe takes hotwords as a dedicated keywords list
+                # The API rejects the whole request for a keyword with <, > or a
+                # line break, so such an entry is left out and named in the log
+                keywords = [w.strip() for w in (request.hotwords or '').split(',')]
+                rejected = [w for w in keywords if w and any(c in w for c in '<>\r\n')]
+                if rejected:
+                    logger.warning(f"Left out {len(rejected)} hotword(s) that gpt-transcribe does not accept "
+                                   f"(they contain <, > or a line break): {rejected!r}")
+                keywords = list(dict.fromkeys(w for w in keywords if w and w not in rejected))
+                if keywords:
+                    params["keywords"] = keywords
+                if request.prompt:
+                    params["prompt"] = request.prompt
             else:
                 # Non-diarization models - combine initial prompt and hotwords
                 prompt_parts = []
@@ -233,7 +262,7 @@ class OpenAITranscribeConnector(BaseTranscriptionConnector):
                 if prompt_parts:
                     params["prompt"] = ". ".join(prompt_parts)
 
-            logger.info(f"Sending request to GPT-4o Transcribe API with model: {effective_model}")
+            logger.info(f"Sending request to OpenAI Transcribe API with model: {effective_model}")
             response = self.client.audio.transcriptions.create(**params)
 
             # Parse response based on format

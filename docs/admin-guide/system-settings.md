@@ -329,12 +329,18 @@ The settings below can be set on this page or in `.env`. Until an admin saves a 
 | `enable_incognito_mode` | `ENABLE_INCOGNITO_MODE` |
 | `enable_internal_sharing` | `ENABLE_INTERNAL_SHARING` |
 | `enable_public_sharing` | `ENABLE_PUBLIC_SHARING` |
+| `enable_stream_options` | `ENABLE_STREAM_OPTIONS` |
 | `global_retention_days` | `GLOBAL_RETENTION_DAYS` |
 | `help_center_label` | `HELP_CENTER_LABEL` |
 | `help_center_url` | `HELP_CENTER_URL` |
 | `incognito_mode_default` | `INCOGNITO_MODE_DEFAULT` |
 | `incognito_temp_max_age_hours` | `INCOGNITO_TEMP_MAX_AGE_HOURS` |
+| `llm_connect_timeout` | `LLM_CONNECT_TIMEOUT` |
+| `llm_max_retries` | `LLM_MAX_RETRIES` |
+| `llm_request_timeout` | `LLM_REQUEST_TIMEOUT` |
+| `llm_write_timeout` | `LLM_WRITE_TIMEOUT` |
 | `max_concurrent_uploads` | `MAX_CONCURRENT_UPLOADS` |
+| `prefix_cache_optimized_prompts` | `PREFIX_CACHE_OPTIMIZED_PROMPTS` |
 | `recording_tombstone_days` | `RECORDING_TOMBSTONE_DAYS` |
 | `registration_allowed_domains` | `REGISTRATION_ALLOWED_DOMAINS` |
 | `require_email_verification` | `REQUIRE_EMAIL_VERIFICATION` |
@@ -346,6 +352,7 @@ The settings below can be set on this page or in `.env`. Until an admin saves a 
 | `sso_api_exchange_clients` | `SSO_API_EXCHANGE_CLIENTS` |
 | `sso_api_scopes` | `SSO_API_SCOPES` |
 | `sso_api_tokens_enabled` | `SSO_API_TOKENS_ENABLED` |
+| `text_model_cache_breakpoints` | `TEXT_MODEL_CACHE_BREAKPOINTS` |
 | `user_search_scope` | `USER_SEARCH_SCOPE` |
 | `users_can_delete` | `USERS_CAN_DELETE` |
 | `video_passthrough_asr` | `VIDEO_PASSTHROUGH_ASR` |
@@ -408,6 +415,8 @@ Speakr uses separate job queues for transcription and summarization to prevent s
 **INDEX_QUEUE_WORKERS**: Number of workers that build the Inquire search chunks (embeddings) of completed recordings, when `ENABLE_INQUIRE_MODE` is on. The chunks are built after a recording is marked completed, and again after its transcript or speaker names are edited, in their own queue, so a slow embedding model does not delay the next transcription or summary. Default: `1`.
 
 **JOB_MAX_RETRIES**: How many times a failed job will be retried before being marked as failed. Default: `3`.
+
+**DB_POOL_SIZE**, **DB_MAX_OVERFLOW**, **DB_POOL_TIMEOUT**: The database connection pool of each gunicorn worker process. Each request thread and each job worker thread holds a connection while it works, and the process that owns the job queue runs both. `DB_POOL_SIZE` connections are kept open, up to `DB_MAX_OVERFLOW` more are opened when needed, and a thread that finds none free waits `DB_POOL_TIMEOUT` seconds before its request fails. The defaults are `10` kept open, an overflow that brings the total to the 8 request threads plus the job workers plus 6 (at least `10`; `11` with the default workers), and `30` seconds. Raise them when the log shows `QueuePool limit ... reached`. With PostgreSQL, the total over all processes (three in the image) must stay below the server's `max_connections`.
 
 **DISABLE_TRANSCRIPT_UNICODE_REWRITE**: Set to `true` to skip the one-time rewrite that stores older transcripts without `\u` escapes, so non-Latin words are found by search. Default: `false`.
 

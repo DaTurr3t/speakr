@@ -11,6 +11,7 @@ import {
     getAudioInputCandidateSignature,
     shouldAutoOfferExternalAudioInput
 } from '../utils/platform.js';
+import { DISPLAY_MEDIA_CONSTRAINTS, closeAudioContext, stopStreams } from '../utils/audio-capture.js';
 
 export function buildMicrophoneConstraints(deviceId = '', disableAudioProcessing = false) {
     const constraints = {
@@ -267,7 +268,7 @@ export function useAudio(state, utils) {
     // stop, discard, and the start-error path.
     function _releaseAudioContext() {
         if (audioContext.value) {
-            try { audioContext.value.close(); } catch (_) { /* already closed */ }
+            closeAudioContext(audioContext.value);
             audioContext.value = null;
         }
         analyser.value = null;
@@ -466,11 +467,8 @@ export function useAudio(state, utils) {
             // This is required for Firefox's "transient activation" security model
             if (needsDisplayMedia) {
                 try {
-                    const displayStream = await navigator.mediaDevices.getDisplayMedia({
-                        video: true,
-                        audio: true,
-                        audioSelection: 'preferred'
-                    });
+                    // The constraints the offline recorder asks with as well (utils/audio-capture.js).
+                    const displayStream = await navigator.mediaDevices.getDisplayMedia({ ...DISPLAY_MEDIA_CONSTRAINTS });
 
                     // Check if we got an audio track
                     const audioTrack = displayStream.getAudioTracks()[0];
@@ -951,7 +949,10 @@ export function useAudio(state, utils) {
                         transcription_model: asrTranscriptionModel.value || ''
                     },
                     mimeType,
-                    incognito: !!(incognitoMode && incognitoMode.value)
+                    incognito: !!(incognitoMode && incognitoMode.value),
+                    // The account the copy belongs to: another account
+                    // signing in on this browser deletes it (#650).
+                    ownerId: document.getElementById('app')?.dataset?.currentUserId || null
                 });
                 currentRecordingSessionStartTime = savedSession ? savedSession.startTime : null;
             } catch (dbError) {
@@ -1138,9 +1139,7 @@ export function useAudio(state, utils) {
 
             // Clean up any started streams
             if (activeStreams.value.length > 0) {
-                activeStreams.value.forEach(stream => {
-                    stream.getTracks().forEach(track => track.stop());
-                });
+                stopStreams(activeStreams.value);
                 activeStreams.value = [];
             }
             // Also release the display stream grabbed before the failure point
@@ -1223,9 +1222,7 @@ export function useAudio(state, utils) {
 
             // Stop all active media streams (mic, screen share, etc.)
             if (activeStreams.value.length > 0) {
-                activeStreams.value.forEach(stream => {
-                    stream.getTracks().forEach(track => track.stop());
-                });
+                stopStreams(activeStreams.value);
                 activeStreams.value = [];
             }
 
@@ -1362,9 +1359,16 @@ export function useAudio(state, utils) {
             clientId: queueClientId,
             fromInProgressRecording: true,  // marker: upload-success handler clears RecordingDB session
             recordingSessionStartTime: currentRecordingSessionStartTime,  // clear only this session (#407)
+            // The server session that could not be finished (finalize failed
+            // above): removed once this upload has reached the server, so it
+            // is not offered for recovery as a second recording (#650).
+            serverSessionId: serverSessionId || null,
             error: null,
             willAutoSummarize: false // Server will tell us via SUMMARIZING status
         });
+        // From here the queue item stands for the server session; the next
+        // recording opens a session of its own.
+        if (serverSessionId) _resetServerSessionState();
 
         // Release the in-memory audio resources so the recording view does not
         // keep showing the old waveform, but DO NOT clear the IndexedDB session
@@ -1644,9 +1648,7 @@ export function useAudio(state, utils) {
         // Stop any still-live capture tracks (e.g. discarding while the tab
         // stayed on the finished-review pane with tracks not yet stopped).
         if (activeStreams.value.length > 0) {
-            activeStreams.value.forEach(stream => {
-                try { stream.getTracks().forEach(track => track.stop()); } catch (_) {}
-            });
+            stopStreams(activeStreams.value);
             activeStreams.value = [];
         }
         if (audioBlobURL.value) {

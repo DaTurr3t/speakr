@@ -11,6 +11,7 @@ import {
     uploadChunk,
     finalizeSession,
     abortSession,
+    discardSession,
     createUploader,
     getRememberedSession,
 } from './server-recording-sessions.js';
@@ -148,6 +149,53 @@ describe('abortSession', () => {
     });
 });
 
+
+describe('the remembered session names its account (#650)', () => {
+    afterEach(() => { vi.restoreAllMocks(); delete global.fetch; });
+
+    it('keeps the id of the account signed in on the page, and none without one', async () => {
+        _installDOM();
+        global.document.getElementById = (id) => (id === 'app' ? { dataset: { currentUserId: '12' } } : null);
+        global.fetch = _installFetchMock([{ status: 201, body: { session_id: 's9', mime_type: 'audio/webm' } }]);
+        await createSession('audio/webm');
+        expect(getRememberedSession()).toMatchObject({ session_id: 's9', owner_id: '12' });
+        _installDOM();
+        global.fetch = _installFetchMock([{ status: 201, body: { session_id: 's10', mime_type: 'audio/webm' } }]);
+        await createSession('audio/webm');
+        expect(getRememberedSession()).toMatchObject({ session_id: 's10', owner_id: null });
+    });
+});
+
+describe('discardSession (#650)', () => {
+    beforeEach(() => { _installDOM(); });
+    afterEach(() => { vi.restoreAllMocks(); delete global.fetch; });
+
+    const remember = (id) => localStorage.setItem('speakr.serverRecordingSession', JSON.stringify({ session_id: id, mime_type: 'audio/webm' }));
+
+    it('DELETEs the session and forgets the pointer when it names this session', async () => {
+        remember('s1');
+        global.fetch = _installFetchMock([{ status: 204 }]);
+        await expect(discardSession('s1')).resolves.toEqual({ ok: true });
+        expect(global.fetch).toHaveBeenCalledWith('/upload/session/s1', expect.objectContaining({ method: 'DELETE' }));
+        expect(getRememberedSession()).toBeNull();
+    });
+
+    it('keeps the pointer of the next recording\'s session', async () => {
+        remember('s2');
+        global.fetch = _installFetchMock([{ status: 404 }]);
+        await expect(discardSession('s1')).resolves.toEqual({ ok: true });
+        expect(getRememberedSession().session_id).toBe('s2');
+    });
+
+    it('sends nothing without a session id, and throws on a server error', async () => {
+        global.fetch = _installFetchMock([{ status: 500, body: { error: 'boom' } }]);
+        await expect(discardSession(null)).resolves.toEqual({ ok: true });
+        expect(global.fetch).not.toHaveBeenCalled();
+        remember('s3');
+        await expect(discardSession('s3')).rejects.toThrow('boom');
+        expect(getRememberedSession().session_id).toBe('s3');
+    });
+});
 
 describe('createUploader queue', () => {
     beforeEach(() => { _installDOM(); });

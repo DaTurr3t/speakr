@@ -11,7 +11,7 @@ A Progressive Web App combines the best of web and mobile apps:
 - **Wake lock** - Prevents screen from auto-sleeping during recording
 - **No app store** - Install directly from your browser
 - **Auto-updates** - Always get the latest version automatically
-- **Offline notice** - A "You are offline" page is shown when the server cannot be reached
+- **Offline recording** - When the server cannot be reached, a page to record on is shown; the recordings are uploaded when the server is back
 
 ## Installing Speakr as a PWA
 
@@ -123,11 +123,20 @@ Each account can share up to 20 files per hour this way (`SHARE_TARGET_RATE_LIMI
 
 ### Without a Connection
 
-A connection to the server is required: recordings, transcripts and summaries are loaded from it each time and are never kept in the browser by the service worker.
+Recordings, transcripts and summaries are loaded from the server each time and are never kept in the browser by the service worker. Without a connection, only recording is possible.
 
-- When the server cannot be reached, a page with the text "You are offline" is shown in place of the browser's error page. The server is asked again every few seconds, and the requested page is loaded as soon as it answers, or with **Try again**.
-- The application files (scripts, styles, fonts, images, translations) are kept in the browser, so a page is loaded faster once the connection is there.
+- **The offline recorder.** When the server cannot be reached, the page "You are offline" is shown in place of the browser's error page, with a **Record** button. A recording made there is kept in this browser and uploaded at the next start of Speakr with a connection. The page lists the recordings that wait for their upload (name, duration and size), and each can be deleted there. Recordings of the library, transcripts and summaries are not shown, and nothing can be searched.
+- **What the offline recorder needs.** Speakr must have been opened with a connection, while signed in, in the same browser, within the last 30 days (`REMEMBER_COOKIE_DAYS`, set by the administrator). Each such visit starts the period again. The recorder's files are kept in the browser at that visit, and in the language of the interface. Before that visit, after a sign-out, and once the period has passed, the page only says that Speakr is offline, without a **Record** button.
+- **Limits of a recording.** A recording made offline stops by itself, and is saved, at the first limit it reaches: the maximum length of an in-app recording (`RECORDING_MAX_HOURS`, 8 hours by default), the size at which the in-app recorder stops (200 MB), the largest file the server accepts for an upload (**Max file size** in the system settings), or the storage the browser has left for the site. While it records, the page shows the time left; at 80 % of it a notice says when the recording will stop, and after the stop a notice names the limit. With too little free storage a recording does not start. At the first save the browser is asked to keep the site's storage; a refusal changes nothing.
+- **Back online.** The server is asked again every few seconds. As soon as it answers, the requested page is loaded, or with **Try again**. During a recording the page waits until the recording is stopped and saved.
+- **A server behind a reverse proxy.** When the proxy answers that Speakr is down (502 or 504), the offline recorder is shown as well.
+- **Upload once.** A recording whose upload failed, in the app or on the offline recorder, is uploaded once when the connection is back. After that upload it is not offered for recovery again at the next start.
+- **Incognito mode.** When incognito mode is on by default, the offline recorder records nothing: a recording made offline would have to be kept in the browser.
+- **Application files** (scripts, styles, fonts, images, translations) are kept in the browser, so a page is loaded faster once the connection is there.
 - A recording in progress is kept in the browser until it is uploaded, and a failed upload is kept for a later retry. Both are described in the [recording guide](recording.md).
+
+!!! note "A browser shared by several accounts"
+    A recording made offline is saved for the account that last opened Speakr online in this browser, and is uploaded only to that account. When another account signs in on the browser, every recording that waits there for the first account is deleted, with its recovery copy, and a notice says how many were deleted. At sign-out, every recording that waits in the browser is deleted, after a question that gives their number. A recording that has not been uploaded never outlives the account that made it on that browser.
 
 ### Mobile Recording Features
 
@@ -222,7 +231,8 @@ A service worker is registered on the signed-in pages, with the whole app as its
 ### What It Does
 
 - **Application files** under `/static/` are kept in the browser's Cache Storage and are taken from there first.
-- **Pages** are always requested from the server. When that fails, the "You are offline" page is shown. No page is stored.
+- **Pages** are always requested from the server. When that fails, the offline recorder is shown, or the plain "You are offline" page when the recorder's files are not in the browser. No page of the server is stored.
+- **The offline recorder's files** (`/static/offline-recorder.html`, its script, styles and the translations of the interface language) are stored when the signed-in app has loaded. They contain no user data.
 - **Everything else** is passed to the server untouched: recordings, transcripts, audio, shared pages, the admin pages, sign-in, uploads. None of it is stored.
 - **At sign-out**, Cache Storage is emptied, together with the other data of the account in the browser. See [Browser storage](../admin-guide/privacy.md#browser-storage).
 
@@ -303,6 +313,15 @@ A new address is used for the worker file with each release (`/sw.js?v=<version>
 1. **Check the connection** to the server; the page is loaded again as soon as the server answers
 2. **Select Try again** on the page
 3. **Check the server** - The same page is shown when the server or the reverse proxy does not answer
+4. **Stop the recording** - While a recording is made on the offline recorder, the page stays until it is stopped and saved
+
+### No Record Button on the Offline Page
+
+1. **Open Speakr once with a connection**, signed in, in this browser; the recorder is available for 30 days from then, or the number of days the administrator set with `REMEMBER_COOKIE_DAYS`
+2. **Sign in again** - After a sign-out the offline page records nothing
+3. **Incognito mode** - When it is on by default, nothing is recorded offline
+4. **Allow the microphone** for the site in the browser's settings
+5. **Free some storage** - With too little free storage for the site, a recording does not start
 
 ## Best Practices
 

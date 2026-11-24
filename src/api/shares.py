@@ -21,10 +21,12 @@ from src.services import audit
 from src.utils import md_to_html
 from src.utils.route_errors import internal_error
 from src.services.storage import get_storage_service
-from src.services.public_shares import active_share_or_404, link_is_https, public_url
+from src.services.public_shares import (active_share_or_404, link_is_https, public_sharing_enabled, public_url,
+                                        user_can_share_publicly)
 from src.utils.mime import served_media_mime, sandbox_media_response
 from src.utils.log_filters import loggable_error, loggable_locator
 from src.utils.localization import api_error, translate, request_language
+from src.utils.request_body import flag_fields, json_body, json_object_body
 
 # Configuration from environment
 READABLE_PUBLIC_LINKS = os.environ.get('READABLE_PUBLIC_LINKS', 'false').lower() == 'true'
@@ -234,7 +236,7 @@ def get_existing_share(recording_id):
 def create_share(recording_id):
     """Create a public share link for a recording."""
     # Check if public sharing is globally enabled
-    if not _self.ENABLE_PUBLIC_SHARING:
+    if not public_sharing_enabled():
         return jsonify(api_error('public_sharing_disabled')), 403
 
     # Check if user has permission to create public shares
@@ -248,10 +250,16 @@ def create_share(recording_id):
     if not recording or recording.user_id != current_user.id:
         return jsonify(api_error('recording_not_found_or_no_share')), 404
 
-    data = request.json
-    share_summary = data.get('share_summary', True)
-    share_notes = data.get('share_notes', True)
-    force_new = data.get('force_new', False)
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
+    # Flags, read like every other one: "false" is false (#665, #687)
+    flags, flag_error = flag_fields(data, ('share_summary', 'share_notes', 'force_new'))
+    if flag_error:
+        return flag_error
+    share_summary = flags.get('share_summary', True)
+    share_notes = flags.get('share_notes', True)
+    force_new = flags.get('force_new', False)
 
     # The web dialog sets the flags of a reused link to what it sent.
     from src.services.public_shares import get_or_create
@@ -282,7 +290,7 @@ def create_share(recording_id):
 def get_shares():
     """Get all public shares for the current user."""
     shares = Share.query.filter_by(user_id=current_user.id).order_by(Share.created_at.desc()).all()
-    enabled = _self.ENABLE_PUBLIC_SHARING
+    enabled = public_sharing_enabled()
     return jsonify([share.to_dict(sharing_enabled=enabled) for share in shares])
 
 
@@ -323,7 +331,7 @@ def get_shares_overview():
             folders.update({f.id: f for f in Folder.query.filter(Folder.id.in_(sorted(wanted)))})
         return shares
 
-    sharing_enabled = _self.ENABLE_PUBLIC_SHARING
+    sharing_enabled = public_sharing_enabled()
     public_links = [s.to_dict(sharing_enabled=sharing_enabled) for s in
                     Share.query.filter_by(user_id=current_user.id)
                     .options(selectinload(Share.recording).load_only(
@@ -383,7 +391,8 @@ def get_shares_overview():
             })
 
     return jsonify({
-        'public_sharing_enabled': _self.ENABLE_PUBLIC_SHARING,
+        'public_sharing_enabled': sharing_enabled,
+        'can_share_publicly': user_can_share_publicly(current_user, sharing_enabled),
         'internal_sharing_enabled': _self.ENABLE_INTERNAL_SHARING,
         'public_links': public_links,
         'shared_by_me': shared_by_me,
@@ -396,12 +405,17 @@ def get_shares_overview():
 def update_share(share_id):
     """Update a public share's settings."""
     share = Share.query.filter_by(id=share_id, user_id=current_user.id).first_or_404()
-    data = request.json
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    flags, flag_error = flag_fields(data, ('share_summary', 'share_notes'))
+    if flag_error:
+        return flag_error
 
-    if 'share_summary' in data:
-        share.share_summary = data['share_summary']
-    if 'share_notes' in data:
-        share.share_notes = data['share_notes']
+    if 'share_summary' in flags:
+        share.share_summary = flags['share_summary']
+    if 'share_notes' in flags:
+        share.share_notes = flags['share_notes']
 
     audit.record_in_tx('share.public.changed', recording_id=share.recording_id,
                        recording_owner_id=share.user_id,
@@ -635,7 +649,10 @@ def share_recording_internal(recording_id):
         return jsonify(api_error('internal_sharing_disabled')), 403
 
     try:
-        data = request.json
+        # A value that is not an object keeps its user_id_required answer
+        data, body_error = json_body()
+        if body_error:
+            return body_error
         if isinstance(data, dict) and ('user_ids' in data or 'identifiers' in data):
             return _share_with_many(recording_id, data)
 
@@ -943,7 +960,7 @@ def get_shared_with_me():
 def can_share_publicly():
     """Check if the current user has permission to create public shares."""
     return jsonify({
-        'can_share_publicly': current_user.can_share_publicly and _self.ENABLE_PUBLIC_SHARING
+        'can_share_publicly': user_can_share_publicly(current_user, public_sharing_enabled())
     })
 
 

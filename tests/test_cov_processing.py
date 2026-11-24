@@ -11,6 +11,7 @@ site so the suite stays fully offline and hermetic.
 SHARED-DB NOTE: the session DB is shared across the whole test suite, so
 every assertion here is scoped to recording/user IDs this file created.
 """
+import json
 import os
 import sys
 import uuid
@@ -77,7 +78,7 @@ def _fake_completion(content, reasoning=None):
 @contextmanager
 def _patch_llm(content="Generated text", reasoning=None, side_effect=None):
     """Patch call_llm_completion and a truthy client at the processing import site."""
-    with patch.object(proc, "client", MagicMock()), \
+    with patch.object(proc.llm_config, "is_configured", return_value=True), \
          patch.object(proc, "call_llm_completion") as mock_call:
         if side_effect is not None:
             mock_call.side_effect = side_effect
@@ -112,7 +113,7 @@ def test_summary_client_not_configured_skips():
         user = _make_user("sum_noclient")
         rec = _make_recording(user.id, status="PENDING")
         rid = rec.id
-        with patch.object(proc, "client", None):
+        with patch.object(proc.llm_config, "is_configured", return_value=False):
             proc.generate_summary_only_task(app.app_context(), rid)
 
         db.session.expire_all()
@@ -345,7 +346,7 @@ def test_title_short_transcription_falls_back_to_filename():
         user = _make_user("title_short")
         rec = _make_recording(user.id, title="Recording - cov.mp3", transcription="hi")
         rid = rec.id
-        with patch.object(proc, "client", MagicMock()), \
+        with patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False):
             proc.generate_title_task(app.app_context(), rid, will_auto_summarize=False)
         db.session.expire_all()
@@ -360,7 +361,7 @@ def test_title_client_not_configured_falls_back_to_filename():
         user = _make_user("title_noclient")
         rec = _make_recording(user.id, title="Recording - cov.mp3")
         rid = rec.id
-        with patch.object(proc, "client", None), \
+        with patch.object(proc.llm_config, "is_configured", return_value=False), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False):
             proc.generate_title_task(app.app_context(), rid, will_auto_summarize=False)
         db.session.expire_all()
@@ -531,7 +532,7 @@ def test_transcribe_with_connector_audio_success():
         with patch("src.services.transcription.get_connector", return_value=connector), \
              patch.object(proc, "is_video_file", return_value=False), \
              patch.object(proc, "convert_if_needed", return_value=conv_result), \
-             patch.object(proc, "client", MagicMock()), \
+             patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
              patch.object(proc, "generate_title_task") as mock_title, \
              patch.object(proc, "generate_summary_only_task") as mock_summary, \
@@ -547,15 +548,25 @@ def test_transcribe_with_connector_audio_success():
         out = db.session.get(Recording, rid)
         assert out.transcription == "A transcribed body of text here."
         assert out.transcription_duration_seconds is not None
-        # Title + summary tasks were invoked downstream.
+        # The title runs in the transcription job; the summary is queued as
+        # a job of its own on the summary workers (D#663).
         mock_title.assert_called_once()
-        mock_summary.assert_called_once()
+        mock_summary.assert_not_called()
+        from src.models import ProcessingJob
+        jobs = ProcessingJob.query.filter_by(recording_id=rid, job_type="summarize").all()
+        assert len(jobs) == 1 and json.loads(jobs[0].params) == {"after_transcription": True}
+        assert out.status == "SUMMARIZING"
+        for job in jobs:
+            db.session.delete(job)
+        db.session.commit()
 
 
-def test_transcribe_with_connector_keeps_transcript_when_auto_summary_fails():
-    """A failed auto-summary leaves the transcription job to complete (#583)."""
+def test_transcribe_with_connector_leaves_the_summary_to_its_job():
+    """The transcription job no longer runs the summary, so a failed summary
+    cannot reach it (#583); the summary job's failure is covered by
+    tests/test_summary_job_after_transcript.py (D#663)."""
     import time as _time
-    from src.services.error_classification import SummaryStepFailed
+    from src.models import ProcessingJob
     with app.app_context():
         user = _make_user("trans_sumfail")
         rec = _make_recording(user.id, transcription=None, status="PENDING")
@@ -567,27 +578,17 @@ def test_transcribe_with_connector_keeps_transcript_when_auto_summary_fails():
         conv_result = MagicMock()
         conv_result.was_converted = False
 
-        def failing_summary(app_context, recording_id, *a, **k):
-            r = db.session.get(Recording, recording_id)
-            r.summary = "[Summary generation failed: Error code: 403 - Forbidden]"
-            r.status = "FAILED"
-            db.session.commit()
-            raise SummaryStepFailed("Error code: 403 - Forbidden",
-                                    stored_summary=r.summary)
-
         with patch("src.services.transcription.get_connector", return_value=connector), \
              patch.object(proc, "is_video_file", return_value=False), \
              patch.object(proc, "convert_if_needed", return_value=conv_result), \
-             patch.object(proc, "client", MagicMock()), \
+             patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
              patch.object(proc, "generate_title_task"), \
-             patch.object(proc, "generate_summary_only_task", side_effect=failing_summary), \
+             patch.object(proc, "generate_summary_only_task") as summary, \
              patch("src.services.webhook_dispatch.emit_webhook_event") as emit, \
              patch.object(proc, "chunking_service") as mock_chunk_svc:
             mock_chunk_svc.needs_chunking.return_value = False
             mock_chunk_svc.get_audio_duration.return_value = 120.0
-            # Must not raise: a raise here would fail the transcription job
-            # and replace the transcript with the error.
             proc.transcribe_with_connector(
                 app.app_context(), rid, tmp_path, "cov.mp3", _time.time(),
                 mime_type="audio/mpeg",
@@ -596,10 +597,12 @@ def test_transcribe_with_connector_keeps_transcript_when_auto_summary_fails():
         db.session.expire_all()
         out = db.session.get(Recording, rid)
         assert out.transcription == "A transcribed body of text here."
-        assert out.status == "FAILED"
-        assert out.summary.startswith("[Summary generation failed:")
+        assert out.status == "SUMMARIZING"
+        summary.assert_not_called()
         types = [c.kwargs["event_type"] for c in emit.call_args_list]
-        assert types.count("recording.summary.failed") == 1
+        assert "recording.summary.failed" not in types
+        ProcessingJob.query.filter_by(recording_id=rid).delete()
+        db.session.commit()
 
 
 def test_transcribe_with_connector_persists_resolved_hints():
@@ -620,7 +623,7 @@ def test_transcribe_with_connector_persists_resolved_hints():
         with patch("src.services.transcription.get_connector", return_value=connector), \
              patch.object(proc, "is_video_file", return_value=False), \
              patch.object(proc, "convert_if_needed", return_value=conv_result), \
-             patch.object(proc, "client", MagicMock()), \
+             patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
              patch.object(proc, "generate_title_task"), \
              patch.object(proc, "generate_summary_only_task"), \
@@ -661,7 +664,7 @@ def test_transcribe_with_connector_resolved_hints_default_none():
         with patch("src.services.transcription.get_connector", return_value=connector), \
              patch.object(proc, "is_video_file", return_value=False), \
              patch.object(proc, "convert_if_needed", return_value=conv_result), \
-             patch.object(proc, "client", MagicMock()), \
+             patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
              patch.object(proc, "generate_title_task"), \
              patch.object(proc, "generate_summary_only_task"), \
@@ -705,7 +708,7 @@ def test_transcribe_with_connector_applies_admin_default_initial_prompt():
         with patch("src.services.transcription.get_connector", return_value=connector), \
              patch.object(proc, "is_video_file", return_value=False), \
              patch.object(proc, "convert_if_needed", return_value=conv_result), \
-             patch.object(proc, "client", MagicMock()), \
+             patch.object(proc.llm_config, "is_configured", return_value=True), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False), \
              patch.object(proc, "generate_title_task"), \
              patch.object(proc, "generate_summary_only_task"), \
@@ -992,7 +995,7 @@ def test_title_uses_user_default_naming_template():
         # Placeholder title + no tags -> falls through to the user-default path.
         rec = _make_recording(user.id, title="Recording - cov.mp3")
         rid = rec.id
-        with patch.object(proc, "client", None), \
+        with patch.object(proc.llm_config, "is_configured", return_value=False), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False):
             proc.generate_title_task(app.app_context(), rid, will_auto_summarize=False)
 
@@ -1039,7 +1042,7 @@ def test_title_tag_template_takes_precedence_over_owner_default():
         db.session.commit()
 
         rid = rec.id
-        with patch.object(proc, "client", None), \
+        with patch.object(proc.llm_config, "is_configured", return_value=False), \
              patch.object(proc, "ENABLE_INQUIRE_MODE", False):
             proc.generate_title_task(app.app_context(), rid, will_auto_summarize=False)
 

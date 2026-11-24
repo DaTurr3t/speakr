@@ -48,6 +48,15 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
 
 `--noconftest` keeps the repository's `conftest.py`, which imports the app, out of a run that only needs Playwright.
 
+### One instance for every browser test
+
+CI runs `tests/e2e/test_browser_smoke.py tests/e2e/test_*_ui.py` against one instance, in alphabetical order. Two rules keep the files independent of that order:
+
+- `run_speakr.py` starts the instance with `RATELIMIT_ENABLED=false`. Every request of the suite comes from 127.0.0.1, so the per-IP limits (1000 requests an hour, ten sign-ins a minute) are reached by the suite itself and answer 429 to whichever test comes next. No browser test relies on a real limit (`test_share_window_ui.py` fakes its 429 with `page.route`); the limits are covered by the Python tests. The published image's smoke test (`smoke_env.py`) keeps the limits.
+- A file leaves no rows in the admin's processing queue or inbox behind: a finished job is a row of the queue on every page, and the phone layout test measures the page. `clear_finished_jobs()` in `browser_checks.py` removes the completed and failed jobs; the offline recorder and trim tests call it when they end (the offline recorder test also deletes what it uploaded, and the toast test removes its upload and jobs itself), and the phone layout test calls it before it measures.
+- A file that changes the account's look puts back what it found: the theme and the dark mode as a freshly loaded page shows them.
+- `login()` signs each account in through the form once per run and reuses that session afterwards; `check_common()` measures its Tailwind probe in rem, so it holds in themes with another root font size.
+
 ## Group permission browser test
 
 `test_group_permission_ui.py` covers who can create groups (#576) in the browser: the `permission_create_groups` radio buttons in System settings, the "Can create groups" toggle in the edit-user dialog, the "Members can create groups" toggle in the group dialog, the Group Management entry in the account menu, and group creation, duplicate names, members added by exact username, group admins and deletion on `/group-management`. Setup goes through the app's HTTP API as the seeded admin (internal sharing on, four users with generated passwords, one group); every user signs in through the login form, and the settings are restored afterwards. The checks for failed responses, JavaScript errors and template text are in `browser_checks.py`, shared with the smoke test; a step that expects a refusal (a duplicate name, an unknown username) registers it. It runs with the same gate and instance as the smoke test, in the same `browser-smoke` job:
@@ -71,6 +80,14 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_E2E_SHOTS=/t
 ```
 
 The waveform of the timeline is computed by the instance with ffmpeg (`GET /audio/<id>/peaks`), so ffmpeg must be installed where Speakr runs; `test.yml` installs it in the `browser-smoke` job.
+
+## Trim browser test
+
+`test_trim_ui.py` covers trim mode in the timeline of the segment editor (#660): the Trim button, the start handle dragged on the waveform, an end time typed in its field (and a text that is not a time), the counts of removed and shortened segments, Preview, Esc and Cancel, a trim refused while edits are unsaved, the app's own question before the cut, and the cut itself, checked against the stored recording (its length and its transcript moved to start at 0:00) and the player on the page. A second test takes screenshots of trim mode in all six themes and at phone width, where a handle is dragged with touch events. It cuts the third seeded recording (`TRIM_TITLE` in `seed_recordings.py`), which no other test uses, so the other tests keep their 90-second audio. Afterwards it removes the admin's finished jobs (a finished trim is a row in the processing queue, which changes the phone layout), and it signs in once (the login form allows ten requests a minute), so the other files pass when it runs before them. It runs with the same gate, instance and CI job as the segment editor test.
+
+## Recording header browser test
+
+`test_header_fixes_ui.py` covers the pen beside the title, which puts the cursor in the title field with the title selected (#686), and the share dialog with public sharing switched off and on in System Settings: off, it says that no public link can be created and has no button for one (#685). The setting is put back afterwards.
 
 ## Transcript view browser test
 
@@ -177,6 +194,20 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
 
 The worker's decision for each kind of request is unit-tested in `static/js/sw.test.js`, the page's side in `static/js/service-worker-client.test.js`, and the `/sw.js` route and the mark the server leaves at sign-out in `tests/test_service_worker.py`.
 
+## Offline recorder browser test
+
+`test_offline_recorder_ui.py` covers recording without a connection and the upload that follows it (#650), in Chromium with a fake microphone (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`). A recording made in the app whose upload fails (the browser offline, the upload refused while the browser reports a connection, the answer of a request that reached the server lost) is uploaded once, and two reloads later the server holds it once and no recovery is offered. With the server down after one online visit, the worker answers the offline recorder: it records, lists the waiting recordings, deletes one after its question, returns to the app when the server answers (not during a recording), and the app uploads the recording once. Sign-out with a waiting recording asks first, with the count, and deletes it; it removes the recorder's files and its account entry, and the offline page then records nothing and shows no user data. When another account signs in on the browser, the waiting recording and the crash-recovery copy of the first account are deleted with a notice, nothing reaches either account, and the first account finds nothing when it signs in again. The account entry expires (`REMEMBER_COOKIE_DAYS`): an expired entry gives no Record button, a fresh one records, and each signed-in load renews it. A recording stops by itself, after a warning at 80 %, at its maximum length or size (limits written into the entry by the test), and is uploaded once with its length; too little storage (a stubbed `navigator.storage.estimate()`) refuses a start or stops a recording with a save. Screenshots of these states are taken in light and dark at 1280 and 390 px. The recorder is checked in the six UI themes, light and dark, at desktop and phone width, and in the seven languages; with `SPEAKR_E2E_SHOTS` set, a screenshot of each is saved.
+
+The server is stopped and started through the control port of `run_speakr.py` (`--control-port`, `SPEAKR_CONTROL_URL`): to the browser, a stopped server is a server that is down, with `navigator.onLine` still true. The scenarios that need it are skipped without it; the others use the browser context's offline mode, which also reaches the worker's requests in Chromium.
+
+```bash
+python tests/e2e/run_speakr.py --port 8899 --control-port 8898 &
+SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_CONTROL_URL=http://127.0.0.1:8898 \
+  pytest tests/e2e/test_offline_recorder_ui.py -q --noconftest -rs
+```
+
+The recorder's decisions are unit-tested in `static/js/modules/utils/offline-recorder-model.test.js`, the ties between a failed upload and its other copies in `static/js/modules/utils/pending-uploads.test.js` and `static/js/modules/composables/upload.test.js`, and the worker's part in `static/js/sw.test.js`.
+
 ## Translation payload browser test
 
 `test_i18n_payload_ui.py` covers the translations a page carries (discussion #611): a page in another language than English embeds that language only. On the public share page for a German browser it checks German text, one embedded table and no request for a locale file. With French saved in the browser and two keys taken out of the French file (the file is answered in the browser context), it checks that French is fetched, that English is fetched once from the versioned address for the missing keys, that the two labels end in English, and that the keys themselves are never shown. It also checks the sign-in page of a German browser, and the main page of an English account (English embedded as before; with German saved in the browser, one request for the German file and none for English).
@@ -193,4 +224,13 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
 ```bash
 SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_E2E_SHOTS=/tmp/shots \
   pytest tests/e2e/test_audit_log_ui.py -q --noconftest -rs
+```
+
+## Language models admin browser test
+
+`test_llm_admin_ui.py` covers three flows of Admin, System settings, Language models that only run in the browser. "Discover models" asks a provider for its model ids, served by `fake_llm_server.py`, and choosing one fills the Model name field. The API key field has an eye button that shows the value being typed and hides it again; a saved key is never sent to the browser. The Extra Body field is checked before a save: invalid JSON (`{bad json`) and a JSON value that is not an object (`[1,2]`) show the validation message and send no POST to `/admin/llm-config/models`; a JSON object passes the check and is saved. At the model limit the panel hides **Add model**, shows the translated limit message, and the API refuses one more model. The discovery step persists nothing, and every model the other steps save is deleted through the admin API at the end of the run. It runs with the same gate and instance as the smoke test:
+
+```bash
+SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
+  pytest tests/e2e/test_llm_admin_ui.py -q --noconftest -rs
 ```

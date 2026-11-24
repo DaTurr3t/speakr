@@ -8,6 +8,8 @@ import os
 import json
 import time
 from datetime import datetime, timedelta
+
+import httpx
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, send_file, Response, current_app
 from flask_login import login_required, current_user, login_user
 from werkzeug.utils import secure_filename
@@ -17,6 +19,8 @@ from src.models import *
 from src.utils import *
 from src.utils.route_errors import internal_error
 from src.utils.localization import translate, api_error
+from src.utils.request_body import (DB_INT_MAX, flag_fields, id_args_error, int_args_error, is_int,
+                                    json_object_body)
 from src.utils.search import contains_pattern, LIKE_ESCAPE
 from src.services.retention import (is_recording_exempt_from_deletion, get_retention_days_for_recording,
                                     process_auto_deletion)
@@ -24,7 +28,7 @@ from src.services.embeddings import EMBEDDINGS_AVAILABLE, process_recording_chun
 from src.services.token_tracking import token_tracker
 from src.services.transcription_tracking import transcription_tracker
 from src.services.storage_quota import default_quota_mb
-from src.services import audit, login_lock
+from src.services import audit, llm_config, login_lock
 from src.auth.permissions import CREATE_GROUPS, set_user_grant, user_has_grant
 from src.config.startup import get_file_monitor_functions
 from src.utils.error_text import describe_error
@@ -245,6 +249,9 @@ def admin_get_users():
         page = 1
     if page < 1:
         page = 1
+    # Clamped like per_page: a page past the column range is an empty page,
+    # not an offset that overflows the query (#664)
+    page = min(page, DB_INT_MAX)
 
     # Cap kept high enough for admin tooling/exports while still bounding
     # response size and query cost. Out-of-range values are clamped to the
@@ -390,7 +397,9 @@ def admin_add_user():
     if not current_user.is_admin:
         return jsonify(api_error('unauthorized')), 403
     
-    data = request.json
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
     
@@ -399,6 +408,12 @@ def admin_add_user():
     for field in required_fields:
         if field not in data:
             return jsonify(api_error('missing_required_field', field=field)), 400
+    account_error = _account_fields_error(data)
+    if account_error:
+        return account_error
+    flags, flag_error = flag_fields(data, ('is_admin',))
+    if flag_error:
+        return flag_error
     
     # The username column holds 20 characters; PostgreSQL refuses a longer
     # value, which gave a 500 instead of this message
@@ -417,6 +432,9 @@ def admin_add_user():
         storage_quota = _quota_mb(data['storage_quota_mb']) if 'storage_quota_mb' in data else default_quota_mb()
     except (TypeError, ValueError):
         return jsonify(api_error('invalid_storage_quota')), 400
+    budgets, bad_budget = _budget_fields(data)
+    if bad_budget:
+        return bad_budget
 
     # Create new user
     hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
@@ -424,9 +442,9 @@ def admin_add_user():
         username=data['username'],
         email=email,
         password=hashed_password,
-        is_admin=data.get('is_admin', False),
-        monthly_token_budget=data.get('monthly_token_budget'),
-        monthly_transcription_budget=data.get('monthly_transcription_budget'),
+        is_admin=flags.get('is_admin', False),
+        monthly_token_budget=budgets.get('monthly_token_budget'),
+        monthly_transcription_budget=budgets.get('monthly_transcription_budget'),
         storage_quota_mb=storage_quota,
     )
     from src.services.user_defaults import apply_new_user_defaults
@@ -471,9 +489,26 @@ def admin_update_user(user_id):
     if not user:
         return jsonify(api_error('user_not_found')), 404
     
-    data = request.json
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
+    # Every field is checked before the first change (#687)
+    account_error = _account_fields_error(data)
+    if account_error:
+        return account_error
+    flags, flag_error = flag_fields(data, ('is_admin', 'can_share_publicly', 'create_groups_granted'))
+    if flag_error:
+        return flag_error
+    budgets, bad_budget = _budget_fields(data)
+    if bad_budget:
+        return bad_budget
+    if 'storage_quota_mb' in data:
+        try:
+            _quota_mb(data['storage_quota_mb'])
+        except (TypeError, ValueError):
+            return jsonify(api_error('invalid_storage_quota')), 400
 
     audited_fields = ('username', 'email', 'can_share_publicly', 'monthly_token_budget',
                       'monthly_transcription_budget', 'storage_quota_mb')
@@ -510,7 +545,7 @@ def admin_update_user(user_id):
         login_lock.clear_failures(user.id)
 
     if 'is_admin' in data:
-        new_is_admin = bool(data['is_admin'])
+        new_is_admin = flags['is_admin']
         # Guard against demoting the last remaining admin, which would lock
         # everyone out of the admin panel with no in-app recovery.
         if user.is_admin and not new_is_admin:
@@ -520,26 +555,18 @@ def admin_update_user(user_id):
         user.is_admin = new_is_admin
 
     if 'can_share_publicly' in data:
-        user.can_share_publicly = data['can_share_publicly']
+        user.can_share_publicly = flags['can_share_publicly']
 
     if 'create_groups_granted' in data:
-        set_user_grant(CREATE_GROUPS, user.id, bool(data['create_groups_granted']))
+        set_user_grant(CREATE_GROUPS, user.id, flags['create_groups_granted'])
 
-    if 'monthly_token_budget' in data:
-        # Allow setting to None (unlimited) or a positive integer
-        budget = data['monthly_token_budget']
-        if budget is None or budget == '' or budget == 0:
-            user.monthly_token_budget = None
-        else:
-            user.monthly_token_budget = int(budget)
-
-    if 'monthly_transcription_budget' in data:
-        # Allow setting to None (unlimited) or a positive integer (in seconds)
-        budget = data['monthly_transcription_budget']
-        if budget is None or budget == '' or budget == 0:
-            user.monthly_transcription_budget = None
-        else:
-            user.monthly_transcription_budget = int(budget)
+    # None, '' or 0 is no limit; the transcription budget is in seconds
+    budgets, bad_budget = _budget_fields(data)
+    if bad_budget:
+        db.session.rollback()
+        return bad_budget
+    for field, value in budgets.items():
+        setattr(user, field, value)
 
     if 'storage_quota_mb' in data:
         try:
@@ -549,7 +576,7 @@ def admin_update_user(user_id):
 
     # The names of the fields that changed, never their values.
     changed = [name for name in audited_fields if getattr(user, name) != before[name]]
-    if 'create_groups_granted' in data and bool(data['create_groups_granted']) != before['create_groups_granted']:
+    if 'create_groups_granted' in data and flags['create_groups_granted'] != before['create_groups_granted']:
         changed.append('create_groups_granted')
     if changed:
         audit.record_in_tx('admin.user.changed', target_user_id=user.id, details={'fields': sorted(changed)})
@@ -704,14 +731,64 @@ def admin_toggle_admin(user_id):
 
 
 
+def _limit_value(value):
+    """A limit from the admin form or API: a whole number of 0 or more, or None
+    for no limit (None, '', 0 and '0'). Raises ValueError for anything else,
+    such as 'abc', '1.5', -1, True or a list (#651)."""
+    if value is None or isinstance(value, bool):
+        if value is None:
+            return None
+        raise ValueError('a limit is a whole number')
+    if isinstance(value, str):
+        value = value.strip()
+        if value == '':
+            return None
+        if not value.isdigit():
+            raise ValueError('a limit is a whole number')
+        value = int(value)
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    elif not isinstance(value, int):
+        raise ValueError('a limit is a whole number')
+    if value < 0:
+        raise ValueError('a limit is not negative')
+    # The budget and quota columns are Integer (#664)
+    if value > DB_INT_MAX:
+        raise ValueError('a limit fits an Integer column')
+    return value or None
+
+
 def _quota_mb(value):
     """A storage quota from the admin form: a positive number of MB, or no limit."""
-    if value in (None, '', 0, '0'):
-        return None
-    value = int(value)
-    if value < 0:
-        raise ValueError('storage_quota_mb must be positive')
-    return value
+    return _limit_value(value)
+
+
+def _account_fields_error(data):
+    """The 400 for a username, email or password of the admin user form
+    that is not a string, or an email longer than its column, else None
+    (#687). A value of another type reached the database or bcrypt."""
+    for field in ('username', 'email', 'password'):
+        if field in data and not isinstance(data[field], str):
+            if field == 'password' and data[field] is None:
+                continue  # no new password
+            return jsonify(api_error('field_must_be_string', field=field)), 400
+    if len((data.get('email') or '').strip()) > 120:
+        return jsonify(api_error('field_too_long', field='email', max=120)), 400
+    return None
+
+
+def _budget_fields(data):
+    """The budget fields present in a request, checked: ({field: value}, None),
+    or (None, the 400 response) for the first invalid one."""
+    values = {}
+    for field in ('monthly_token_budget', 'monthly_transcription_budget'):
+        if field in data:
+            try:
+                values[field] = _limit_value(data[field])
+            except ValueError:
+                code = 'invalid_token_budget' if field == 'monthly_token_budget' else 'invalid_transcription_budget'
+                return None, (jsonify(api_error(code)), 400)
+    return values, None
 
 
 # --- Audit log ---------------------------------------------------------------
@@ -811,6 +888,9 @@ def admin_audit_log():
     """
     if not current_user.is_admin:
         return jsonify(api_error('unauthorized')), 403
+    arg_error = id_args_error(('user', 'recording_id', 'before_id', 'after_id'), code='invalid_audit_filter')
+    if arg_error:
+        return arg_error
     try:
         filters, used = _audit_filters()
         before_id = request.args.get('before_id', type=int)
@@ -1103,6 +1183,9 @@ def admin_get_daily_token_stats():
         return jsonify(api_error('unauthorized')), 403
 
     try:
+        arg_error = id_args_error(('user_id',)) or int_args_error({'days': (1, 3650)})
+        if arg_error:
+            return arg_error
         days = request.args.get('days', 30, type=int)
         user_id = request.args.get('user_id', type=int)
 
@@ -1126,6 +1209,9 @@ def admin_get_monthly_token_stats():
         return jsonify(api_error('unauthorized')), 403
 
     try:
+        arg_error = int_args_error({'months': (1, 1200)})
+        if arg_error:
+            return arg_error
         months = request.args.get('months', 12, type=int)
 
         monthly_stats = token_tracker.get_monthly_stats(months=months)
@@ -1209,6 +1295,9 @@ def admin_get_daily_transcription_stats():
         return jsonify(api_error('unauthorized')), 403
 
     try:
+        arg_error = id_args_error(('user_id',)) or int_args_error({'days': (1, 3650)})
+        if arg_error:
+            return arg_error
         days = request.args.get('days', 30, type=int)
         user_id = request.args.get('user_id', type=int)
 
@@ -1232,6 +1321,9 @@ def admin_get_monthly_transcription_stats():
         return jsonify(api_error('unauthorized')), 403
 
     try:
+        arg_error = int_args_error({'months': (1, 1200)})
+        if arg_error:
+            return arg_error
         months = request.args.get('months', 12, type=int)
 
         monthly_stats = transcription_tracker.get_monthly_stats(months=months)
@@ -1289,7 +1381,10 @@ def admin_set_llm_temperatures():
     if not current_user.is_admin:
         return jsonify(api_error('unauthorized')), 403
     from src.services.llm_settings import TEMPERATURES, parse_temperature, setting_key, temperatures_status
-    values = (request.get_json(silent=True) or {}).get('values')
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    values = data.get('values')
     if not isinstance(values, dict) or not values:
         return jsonify(api_error('invalid_temperature_values')), 400
     unknown = [k for k in values if k not in TEMPERATURES]
@@ -1329,6 +1424,9 @@ def admin_get_settings():
     settings = SystemSetting.query.order_by(func.lower(SystemSetting.key)).all()
     result = []
     for setting in settings:
+        if setting.key == llm_config.SETTING_KEY:
+            # Managed by the LLM configuration API only.
+            continue
         data = setting.to_dict()
         if setting.key in ENV_BACKED_SETTINGS:
             data['env_backed'] = True
@@ -1352,7 +1450,9 @@ def admin_update_setting():
     if not current_user.is_admin:
         return jsonify(api_error('unauthorized')), 403
     
-    data = request.json
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
     
@@ -1363,6 +1463,13 @@ def admin_update_setting():
     
     if not key:
         return jsonify(api_error('setting_key_required')), 400
+    # The key, type and description are strings (#687)
+    for field, field_value in (('key', key), ('setting_type', setting_type), ('description', description)):
+        if field_value is not None and not isinstance(field_value, str):
+            return jsonify(api_error('field_must_be_string', field=field)), 400
+
+    if key == llm_config.SETTING_KEY:
+        return jsonify(api_error('llm_config_managed_elsewhere')), 400
     
     # An empty value for a setting that falls back to .env clears the saved
     # value, so the .env value applies again (#567).
@@ -1478,6 +1585,310 @@ def admin_update_setting():
         db.session.rollback()
         current_app.logger.error(f"Error updating setting {key}: {e}")
         return internal_error(e)
+
+
+# --- LLM models and role assignments ----------------------------------------
+
+
+class _LLMBodyError(Exception):
+    """A request body that is missing, malformed or not an object."""
+
+    def __init__(self, response):
+        super().__init__('unusable request body')
+        self.response = response
+
+
+def _llm_payload(optional=False):
+    """The JSON object body of a request (#661).
+
+    Parsed strictly: a malformed body, a content type other than JSON or a
+    value that is not an object is a 400 or 415 with an error code, never an
+    empty object that would revert a role. With optional=True a request
+    without a body reads as {}.
+    """
+    payload, error = json_object_body(optional=optional)
+    if error:
+        raise _LLMBodyError(error)
+    return payload
+
+
+def _llm_role_or_error(role):
+    """The canonical role name, or a ready 400 response."""
+    try:
+        return llm_config.normalize_role(role), None
+    except llm_config.LLMConfigError as error:
+        return None, _llm_error_response(error)
+
+
+def _llm_error_response(error):
+    """The response for a rejected LLM model or assignment change."""
+    if isinstance(error, _LLMBodyError):
+        return error.response
+    body = api_error(error.code, **error.params)
+    if isinstance(error, llm_config.LLMModelNotFound):
+        return jsonify(body), 404
+    if isinstance(error, llm_config.LLMModelInUse):
+        return jsonify({**body, 'roles': list(error.roles)}), 409
+    return jsonify(body), 400
+
+
+def _llm_roles_response():
+    """The assignments and the effective configuration of every role.
+
+    A stored id that no longer matches a configured model reads as
+    unassigned, exactly as it resolves, so the UI never selects an option
+    that is not in the list.
+    """
+    document = llm_config.load_document()
+    model_ids = {model['id'] for model in document['models']}
+    assignments = {
+        role: (model_id if model_id in model_ids else None)
+        for role, model_id in document['assignments'].items()
+    }
+    return {
+        'assignments': assignments,
+        'roles': {role: llm_config.public_config(role) for role in llm_config.ROLES},
+    }
+
+
+def _ask_provider_for_models(base_url, api_key):
+    """The models the provider lists at {base_url}/models."""
+    headers = {'Accept': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    response = httpx.get(f'{base_url}/models', headers=headers, timeout=20.0)
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise TypeError('the answer is not a JSON object')
+    return [
+        {'id': model['id'], 'owned_by': model.get('owned_by')}
+        for model in (body.get('data') or [])
+        if isinstance(model, dict) and model.get('id')
+    ]
+
+
+def _llm_discovery_failure(base_url, error):
+    """A 502 that says why the provider could not be reached."""
+    if isinstance(error, httpx.HTTPStatusError):
+        body = api_error('llm_provider_http_error',
+                         status=error.response.status_code, url=f'{base_url}/models')
+    elif isinstance(error, httpx.TimeoutException):
+        body = api_error('llm_provider_timeout', url=base_url)
+    elif isinstance(error, httpx.ConnectError):
+        body = api_error('llm_provider_unreachable', url=base_url)
+    else:
+        body = api_error('llm_provider_unexpected_answer', detail=error)
+    return jsonify({**body, 'success': False}), 502
+
+
+_PROBE_FIELDS = frozenset({'base_url', 'api_key', 'model_id'})
+
+
+def _probe_target(payload):
+    """The provider URL and key a discovery or test request describes.
+
+    A saved model may be given as the base; a masked or empty key then keeps
+    its stored secret, so a test does not ask for the key again. The stored
+    key goes only to the base URL it was saved with: for another URL, only a
+    key entered now is sent.
+    """
+    unknown = sorted(payload.keys() - _PROBE_FIELDS)
+    if unknown:
+        raise llm_config.LLMConfigError(
+            f"Unknown field(s): {', '.join(unknown)}",
+            'llm_unknown_fields', fields=', '.join(unknown))
+    model_id = payload.get('model_id')
+    if model_id is not None and (not isinstance(model_id, str) or not model_id.strip()):
+        raise llm_config.LLMConfigError('model_id must be the id of a configured model',
+                                        'llm_invalid_model_id')
+    saved_url, saved_key = llm_config.saved_connection(model_id.strip()) if model_id else ('', '')
+    base_url = payload.get('base_url')
+    if base_url is None or (isinstance(base_url, str) and not base_url.strip()):
+        base_url = saved_url
+    base_url = llm_config.normalize_base_url(base_url)
+    if base_url != saved_url:
+        api_key = llm_config.new_key(payload.get('api_key'), saved_key)
+    else:
+        api_key = llm_config.merge_api_key(payload.get('api_key'), saved_key)
+    return base_url, api_key
+
+
+def _probe_response(payload):
+    """Ask the provider for its models and answer with the list or an error."""
+    try:
+        base_url, api_key = _probe_target(payload)
+    except llm_config.LLMConfigError as error:
+        return _llm_error_response(error)
+
+    try:
+        models = _ask_provider_for_models(base_url, api_key)
+    except httpx.HTTPError as error:
+        return _llm_discovery_failure(base_url, error)
+    except (TypeError, ValueError) as error:
+        return jsonify({**api_error('llm_provider_unexpected_answer', detail=error),
+                        'success': False}), 502
+    return jsonify({'success': True, 'models': models})
+
+
+@admin_bp.route('/admin/llm-config', methods=['GET'])
+@login_required
+def admin_get_llm_config():
+    """The configured models, their assignments and each role in effect.
+
+    API keys are write-only: a stored key reads as the mask, in the models
+    and in the roles alike (#661).
+    """
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    return jsonify({
+        'models': llm_config.list_models(),
+        'masked_api_key': llm_config.MASKED_API_KEY,
+        'model_limit': llm_config.MAX_MODELS,
+        **_llm_roles_response(),
+    })
+
+
+@admin_bp.route('/admin/llm-config/models', methods=['POST'])
+@login_required
+def admin_create_llm_model():
+    """Add a configured model."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    try:
+        result = llm_config.create_model(_llm_payload())
+    except (llm_config.LLMConfigError, _LLMBodyError) as error:
+        db.session.rollback()
+        return _llm_error_response(error)
+
+    audit.llm_model_created(result.model['id'], result.changed_fields)
+    db.session.commit()
+    return jsonify({'success': True, 'model': result.model}), 201
+
+
+@admin_bp.route('/admin/llm-config/models/<model_id>', methods=['POST'])
+@login_required
+def admin_update_llm_model(model_id):
+    """Change a configured model. Omitted fields keep their value."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    try:
+        result = llm_config.update_model(model_id, _llm_payload())
+    except (llm_config.LLMConfigError, _LLMBodyError) as error:
+        db.session.rollback()
+        return _llm_error_response(error)
+
+    if result.changed_fields:
+        audit.llm_model_changed(model_id, result.changed_fields)
+    db.session.commit()
+    return jsonify({'success': True, 'model': result.model})
+
+
+@admin_bp.route('/admin/llm-config/models/<model_id>', methods=['DELETE'])
+@login_required
+def admin_delete_llm_model(model_id):
+    """Delete a model that no role uses."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    try:
+        removed = llm_config.delete_model(model_id)
+    except llm_config.LLMConfigError as error:
+        db.session.rollback()
+        return _llm_error_response(error)
+
+    audit.llm_model_deleted(removed['id'])
+    db.session.commit()
+    return jsonify({'success': True})
+
+
+@admin_bp.route('/admin/llm-config/assignments/<role>', methods=['POST'])
+@login_required
+def admin_assign_llm_model(role):
+    """Assign a model to a role, or revert it to the environment with null."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    role, error = _llm_role_or_error(role)
+    if error:
+        return error
+
+    try:
+        payload = _llm_payload()
+        # model_id is required: null returns the role to the environment, so
+        # a body without it must not read as that choice.
+        if 'model_id' not in payload:
+            raise llm_config.LLMConfigError('model_id is required',
+                                            'missing_required_field', field='model_id')
+        change = llm_config.assign_model(role, payload['model_id'])
+    except (llm_config.LLMConfigError, _LLMBodyError) as error:
+        db.session.rollback()
+        return _llm_error_response(error)
+
+    if change.old != change.new:
+        if change.new is None:
+            audit.llm_role_reverted(change.role, change.old)
+        else:
+            audit.llm_role_assigned(change.role, change.new, change.old)
+    db.session.commit()
+    return jsonify({'success': True, **_llm_roles_response()})
+
+
+@admin_bp.route('/admin/llm-config/assignments/<role>', methods=['DELETE'])
+@login_required
+def admin_revert_llm_assignment(role):
+    """Return a role to its environment configuration."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    role, error = _llm_role_or_error(role)
+    if error:
+        return error
+
+    change = llm_config.clear_assignment(role)
+    if change.old is not None:
+        audit.llm_role_reverted(role, change.old)
+    db.session.commit()
+    return jsonify({'success': True, **_llm_roles_response()})
+
+
+@admin_bp.route('/admin/llm-config/test', methods=['POST'])
+@login_required
+def admin_probe_llm_configuration():
+    """Discover or test a provider with the values of a form, nothing saved."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    try:
+        payload = _llm_payload(optional=True)
+    except _LLMBodyError as error:
+        return _llm_error_response(error)
+    return _probe_response(payload)
+
+
+@admin_bp.route('/admin/llm-config/models/<model_id>/test', methods=['POST'])
+@login_required
+def admin_test_llm_model(model_id):
+    """Test a saved model, with optional base_url and api_key overrides."""
+    if not current_user.is_admin:
+        return jsonify(api_error('unauthorized')), 403
+
+    try:
+        payload = _llm_payload(optional=True)
+        unsupported_fields = sorted(payload.keys() - {'base_url', 'api_key'})
+        if unsupported_fields:
+            fields = ', '.join(unsupported_fields)
+            raise llm_config.LLMConfigError(
+                f'Unsupported model test override field(s): {fields}',
+                'llm_unknown_fields', fields=fields)
+        llm_config.get_model(model_id)
+    except (llm_config.LLMConfigError, _LLMBodyError) as error:
+        return _llm_error_response(error)
+    payload['model_id'] = model_id
+    return _probe_response(payload)
 
 
 @admin_bp.route('/admin/user-defaults', methods=['GET'])
@@ -1671,7 +2082,7 @@ def admin_get_auto_process_status():
         return jsonify(api_error('unauthorized')), 403
     
     try:
-        _, _, get_file_monitor_status = get_file_monitor_functions()
+        _, _, get_file_monitor_status = get_file_monitor_functions(current_app._get_current_object())
         status = get_file_monitor_status()
         
         # Add configuration info
@@ -1702,7 +2113,7 @@ def admin_start_auto_process():
         return jsonify(api_error('unauthorized')), 403
     
     try:
-        start_file_monitor, _, _ = get_file_monitor_functions()
+        start_file_monitor, _, _ = get_file_monitor_functions(current_app._get_current_object())
         start_file_monitor()
         return jsonify({'success': True, 'message': translate('server.apiMessage.autoProcessingStarted')})
     except Exception as e:
@@ -1719,7 +2130,7 @@ def admin_stop_auto_process():
         return jsonify(api_error('unauthorized')), 403
     
     try:
-        _, stop_file_monitor, _ = get_file_monitor_functions()
+        _, stop_file_monitor, _ = get_file_monitor_functions(current_app._get_current_object())
         stop_file_monitor()
         return jsonify({'success': True, 'message': translate('server.apiMessage.autoProcessingStopped')})
     except Exception as e:
@@ -1736,7 +2147,9 @@ def admin_update_auto_process_config():
         return jsonify(api_error('unauthorized')), 403
     
     try:
-        data = request.json
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
         if not data:
             return jsonify(api_error('no_configuration_data')), 400
         
@@ -1888,7 +2301,10 @@ def admin_save_visible_models():
         from src.models import SystemSetting
         import json as _json
 
-        data = request.json or {}
+        # A body is required, as before ({} for the defaults)
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
         options = data.get('options', [])
         if not isinstance(options, list):
             return jsonify(api_error('invalid_options_list')), 400
@@ -1960,10 +2376,23 @@ def admin_process_recordings_for_inquire():
         return jsonify(api_error('unauthorized')), 403
 
     try:
-        data = request.json or {}
-        batch_size = int(data.get('batch_size', 10) or 10)
+        # A body is required, as before ({} for the defaults)
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
+        # Whole numbers and a flag, checked before any work (#687)
+        batch_size = data.get('batch_size', 10)
+        if batch_size is None:
+            batch_size = 10
+        if not is_int(batch_size) or not 1 <= batch_size <= 1000:
+            return jsonify(api_error('field_out_of_range', field='batch_size', min=1, max=1000)), 400
         max_recordings = data.get('max_recordings', None)
-        force = bool(data.get('force', False))
+        if max_recordings is not None and (not is_int(max_recordings) or not 1 <= max_recordings <= DB_INT_MAX):
+            return jsonify(api_error('field_out_of_range', field='max_recordings', min=1, max=DB_INT_MAX)), 400
+        flags, flag_error = flag_fields(data, ('force',))
+        if flag_error:
+            return flag_error
+        force = flags.get('force', False)
 
         if force:
             # Re-embed every recording that has a usable transcription, plus

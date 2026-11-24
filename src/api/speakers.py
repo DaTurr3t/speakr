@@ -24,6 +24,7 @@ from src.services.speaker_merge import merge_speakers, preview_merge, can_merge_
 from src.utils.localization import api_error, translate
 from src.services import audit
 from src.utils.speaker_labels import MAX_SPEAKER_NAME_LENGTH, is_generic_speaker_label, speaker_name_too_long
+from src.utils.request_body import json_object_body, str_field
 
 # Create blueprint
 speakers_bp = Blueprint('speakers', __name__)
@@ -106,11 +107,13 @@ def search_speakers():
 def create_speaker():
     """Create a new speaker or update existing one."""
     try:
-        data = request.json
-        name = data.get('name', '').strip()
-        
-        if not name:
-            return jsonify(api_error('speaker_name_required')), 400
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
+        # A name is a non-blank string; null or a number is refused (#680)
+        name, name_error = str_field(data, 'name', 'speaker_name_required')
+        if name_error:
+            return name_error
         if is_generic_speaker_label(name):
             return jsonify(api_error('speaker_name_generic')), 400
         if speaker_name_too_long(name):
@@ -154,11 +157,13 @@ def update_speaker(speaker_id):
         if not speaker:
             return jsonify(api_error('speaker_not_found')), 404
 
-        data = request.json
-        new_name = data.get('name', '').strip()
-
-        if not new_name:
-            return jsonify(api_error('speaker_name_empty')), 400
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
+        # A name is a non-blank string; null or a number is refused (#680)
+        new_name, name_error = str_field(data, 'name', 'speaker_name_empty')
+        if name_error:
+            return name_error
         if is_generic_speaker_label(new_name):
             return jsonify(api_error('speaker_name_generic')), 400
         if speaker_name_too_long(new_name):
@@ -588,7 +593,9 @@ def merge_speaker_profiles():
     Returns merged speaker data or preview statistics.
     """
     try:
-        data = request.json
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
         target_id = data.get('target_id')
         source_ids = data.get('source_ids', [])
         preview = data.get('preview', False)

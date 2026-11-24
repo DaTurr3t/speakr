@@ -1686,6 +1686,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const speakerCountMode = ref('range');           // User pref: 'range' (min/max) or 'single' (one count)
             const connectorSupportsHotwords = ref(false);     // Connector accepts hotword/keyword biasing
             const connectorSupportsInitialPrompt = ref(false); // Connector accepts initial prompt / context hint
+            const connectorSupportsLanguage = ref(false);     // Connector sends a chosen language to the service
             const showTimestampsSimpleView = ref(false);     // User pref: display timestamps in simple view
             const editorAutosave = ref(false);                // User pref: autosave transcript editor
             const audioPlayerPosition = ref('bottom');        // User pref: 'bottom' or 'top' for desktop player placement
@@ -2091,7 +2092,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Dropdown Positioning
 
                 // App Config
-                useAsrEndpoint, connectorSupportsDiarization, connectorSupportsSpeakerCount, connectorSupportsExactSpeakerCount, speakerCountMode, connectorSupportsHotwords, connectorSupportsInitialPrompt, showTimestampsSimpleView, editorAutosave, audioPlayerPosition, formatTimestamp, currentUserName, canDeleteRecordings, enableInternalSharing, enableAudioRemovedFilter, showUsernamesInUI, userSearchScope,
+                useAsrEndpoint, connectorSupportsDiarization, connectorSupportsSpeakerCount, connectorSupportsExactSpeakerCount, speakerCountMode, connectorSupportsHotwords, connectorSupportsInitialPrompt, connectorSupportsLanguage, showTimestampsSimpleView, editorAutosave, audioPlayerPosition, formatTimestamp, currentUserName, canDeleteRecordings, enableInternalSharing, enableAudioRemovedFilter, showUsernamesInUI, userSearchScope,
 
                 // Internal Sharing
                 showUnifiedShareModal, internalShareUserSearch, internalShareSearchResults,
@@ -4477,6 +4478,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     speakerCountMode.value = appElement.dataset.speakerCountMode === 'single' ? 'single' : 'range';
                     connectorSupportsHotwords.value = appElement.dataset.connectorSupportsHotwords === 'True';
                     connectorSupportsInitialPrompt.value = appElement.dataset.connectorSupportsInitialPrompt === 'True';
+                    connectorSupportsLanguage.value = appElement.dataset.connectorSupportsLanguage === 'True';
                     showTimestampsSimpleView.value = appElement.dataset.showTimestampsSimpleView === 'True';
                     editorAutosave.value = appElement.dataset.editorAutosave === 'True';
                     const pos = appElement.dataset.audioPlayerPosition;
@@ -4546,6 +4548,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // recoverable (already finalized / aborted / expired), we
                 // forget it AND clear the now-redundant local copy so the old
                 // double-prompt + duplicate-restore bug can't recur.
+                // Copies of another account that signed in on this browser
+                // before (a session that ended without a sign-out) are
+                // deleted first, with a notice: they are neither offered
+                // nor uploaded to this account (#650).
+                try { await uploadComposable.removeOtherAccountsCopies(); }
+                catch (error) { console.warn('[App] Copies of other accounts not checked:', error); }
                 try {
                     const ServerSessions = await import('./modules/db/server-recording-sessions.js');
                     const remembered = ServerSessions.getRememberedSession();
@@ -4555,7 +4563,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                         catch (_) { serverSession = null; }
                     }
 
-                    if (serverSession && serverSession.status === 'recording' && serverSession.chunk_count > 0) {
+                    // A copy whose recording waits in this browser as a failed
+                    // upload is not offered: the upload of that record (below,
+                    // resurfaceFailedUploads) is the one copy that goes up, and
+                    // its success removes the others (#650).
+                    const serverCovered = !!(serverSession && remembered && await uploadComposable.pendingUploadCovers({ sessionId: remembered.session_id }));
+                    if (serverCovered) {
+                        console.log('[App] The remembered server session waits as a failed upload; not offered for recovery');
+                    } else if (serverSession && serverSession.status === 'recording' && serverSession.chunk_count > 0) {
                         // Pull any local metadata (mode/notes) just for display.
                         let localMeta = null;
                         try { localMeta = await audioComposable.checkForRecoverableRecording(); } catch (_) { /* ignore */ }
@@ -4580,7 +4595,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                     } else {
                         // No server session involved → legacy local recovery.
                         const recoverable = await audioComposable.checkForRecoverableRecording();
-                        if (recoverable && recoverable.chunks && recoverable.chunks.length > 0) {
+                        if (recoverable && recoverable.chunks && recoverable.chunks.length > 0
+                            && await uploadComposable.pendingUploadCovers({ startTime: recoverable.startTime })) {
+                            // The whole recording waits as a failed upload: the
+                            // chunks saved while it was recorded are redundant.
+                            console.log('[App] The local recording waits as a failed upload; its recovery copy is removed');
+                            try { await audioComposable.clearRecordingSession(); } catch (_) { /* ignore */ }
+                        } else if (recoverable && recoverable.chunks && recoverable.chunks.length > 0) {
                             recoverableRecording.value = { source: 'local', ...recoverable };
                             showRecoveryModal.value = true;
                             console.log('[App] Found local recoverable recording, showing recovery dialog');
@@ -4818,6 +4839,28 @@ document.addEventListener('DOMContentLoaded', async () => {
                     }
                 } catch (error) {
                     console.error('Failed to load config:', error);
+                }
+
+                // The account and language for the offline recorder page,
+                // and its files in the service worker's cache (#650).
+                try {
+                    const { rememberForOfflineRecorder } = await import('./modules/db/offline-recorder-context.js');
+                    const appEl = document.getElementById('app');
+                    const data = (appEl && appEl.dataset) || {};
+                    const MB = 1024 * 1024;
+                    rememberForOfflineRecorder({
+                        userId: data.currentUserId || '',
+                        locale: (window.i18n && window.i18n.currentLocale) || 'en',
+                        incognitoDefault: !!(enableIncognitoMode.value && incognitoMode.value),
+                        // REMEMBER_COOKIE_DAYS: the note lasts as long as a remembered sign-in.
+                        days: parseFloat(data.rememberCookieDays) || 30,
+                        // The limits of the in-app recorder and of the server's upload.
+                        maxSeconds: (parseFloat(data.recordingMaxHours) || 8) * 3600,
+                        maxRecorderBytes: (maxRecordingMB.value || 0) * MB,
+                        maxUploadBytes: (maxFileSizeMB.value || 0) * MB,
+                    });
+                } catch (error) {
+                    console.warn('[App] Offline recorder not prepared:', error);
                 }
 
                 // Initialize UI settings from localStorage

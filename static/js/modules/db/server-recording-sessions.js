@@ -32,10 +32,18 @@ function csrfToken() {
 
 /** Persist the active session id so we can resume after refresh. */
 function rememberActiveSession(sessionId, mimeType) {
+    let ownerId = null;
+    try {
+        const el = typeof document !== 'undefined' && document.getElementById ? document.getElementById('app') : null;
+        ownerId = (el && el.dataset && el.dataset.currentUserId) || null;
+    } catch (_) { ownerId = null; }
     try {
         localStorage.setItem(PENDING_KEY, JSON.stringify({
             session_id: sessionId,
             mime_type: mimeType,
+            // The account that opened it; another account signing in on
+            // this browser forgets the pointer (#650).
+            owner_id: ownerId,
             stamped_at: Date.now(),
         }));
     } catch (_) { /* private mode: best-effort */ }
@@ -171,6 +179,29 @@ export async function abortSession(sessionId) {
     });
     forgetActiveSession();
     if (resp.status === 204 || resp.status === 404) return { ok: true };
+    const body = await safeJson(resp);
+    throw new Error(body?.error || t('errors.recordingAbortFailed', { status: resp.status }, `Abort failed (HTTP ${resp.status})`));
+}
+
+/**
+ * Remove a session whose recording reached the server another way: in one
+ * piece through POST /upload after finalize failed, offline at Stop (#650).
+ * DELETE as abortSession, but the remembered pointer is forgotten only when
+ * it still names this session: the upload may finish while the next
+ * recording, with a session of its own, is under way.
+ */
+export async function discardSession(sessionId) {
+    if (!sessionId) return { ok: true };
+    const remembered = getRememberedSession();
+    const resp = await fetch(`${SESSION_BASE}/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: { 'X-CSRFToken': csrfToken() },
+    });
+    if (resp.status === 204 || resp.status === 404) {
+        if (remembered && remembered.session_id === sessionId) forgetActiveSession();
+        return { ok: true };
+    }
     const body = await safeJson(resp);
     throw new Error(body?.error || t('errors.recordingAbortFailed', { status: resp.status }, `Abort failed (HTTP ${resp.status})`));
 }

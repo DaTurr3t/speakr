@@ -264,7 +264,10 @@ def record_timezone():
     chose a zone in Account settings keeps it.
     """
     from src.utils.timezones import record_browser_timezone, user_timezone, MODE_AUTO
-    data = request.get_json(silent=True) or {}
+    from src.utils.request_body import json_object_body
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     if record_browser_timezone(current_user, data.get('timezone')):
         db.session.commit()
     return jsonify({
@@ -943,7 +946,9 @@ def account():
             ui_lang = request.form.get('ui_language')
             transcription_lang = request.form.get('transcription_language')
             output_lang = request.form.get('output_language')
-            current_user.ui_language = ui_lang if ui_lang else 'en'
+            # Only a shipped interface locale is stored (#659)
+            from src.utils.localization import match_language
+            current_user.ui_language = match_language(ui_lang) or 'en'
             # Normalize transcription_language so legacy display-name values
             # ("Français", "Deutsch", ...) can't reach the ASR call (issue #256).
             from src.utils.language import normalize_language_code
@@ -1087,6 +1092,7 @@ def account():
     connector_supports_diarization = USE_ASR_ENDPOINT  # Default to USE_ASR_ENDPOINT for backwards compat
     connector_supports_hotwords = USE_ASR_ENDPOINT
     connector_supports_initial_prompt = USE_ASR_ENDPOINT
+    connector_supports_language = USE_ASR_ENDPOINT
     connector_supports_speaker_embeddings = ASR_RETURN_SPEAKER_EMBEDDINGS
     if USE_NEW_TRANSCRIPTION_ARCHITECTURE:
         try:
@@ -1098,6 +1104,7 @@ def account():
                 connector_supports_diarization = connector.supports_diarization
                 connector_supports_hotwords = connector.supports_hotwords
                 connector_supports_initial_prompt = connector.supports_initial_prompt
+                connector_supports_language = connector.supports_language_selection
                 # Query the live instance: the asr_endpoint connector adds the
                 # SPEAKER_EMBEDDINGS capability conditionally (only when its env
                 # flag is on), so the class-level set would be wrong.
@@ -1165,6 +1172,7 @@ def account():
                            connector_supports_diarization=connector_supports_diarization,
                            connector_supports_hotwords=connector_supports_hotwords,
                            connector_supports_initial_prompt=connector_supports_initial_prompt,
+                           connector_supports_language=connector_supports_language,
                            enable_auto_deletion=ENABLE_AUTO_DELETION,
                            enable_internal_sharing=ENABLE_INTERNAL_SHARING,
                            user_admin_groups=user_admin_groups,
@@ -1194,14 +1202,18 @@ def account():
 @login_required
 def update_auto_speaker_labelling():
     """Update user's auto speaker labelling settings."""
-    data = request.get_json()
-
-    if data is None:
-        return jsonify({'success': False, **api_error('invalid_json')}), 400
+    from src.utils.request_body import flag_fields, json_object_body
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    # "false" is false: a flag is parsed, never cast (#665)
+    flags, flag_error = flag_fields(data, ('enabled',))
+    if flag_error:
+        return flag_error
 
     # Update enabled state
-    if 'enabled' in data:
-        current_user.auto_speaker_labelling = bool(data['enabled'])
+    if 'enabled' in flags:
+        current_user.auto_speaker_labelling = flags['enabled']
 
     # Update threshold (validate value)
     if 'threshold' in data:
@@ -1224,13 +1236,16 @@ def update_auto_speaker_labelling():
 @login_required
 def update_auto_summarization():
     """Update user's auto summarization setting."""
-    data = request.get_json()
+    from src.utils.request_body import flag_fields, json_object_body
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    flags, flag_error = flag_fields(data, ('enabled',))
+    if flag_error:
+        return flag_error
 
-    if data is None:
-        return jsonify({'success': False, **api_error('invalid_json')}), 400
-
-    if 'enabled' in data:
-        current_user.auto_summarization = bool(data['enabled'])
+    if 'enabled' in flags:
+        current_user.auto_summarization = flags['enabled']
         db.session.commit()
 
     return jsonify({

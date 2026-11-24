@@ -21,7 +21,8 @@ from datetime import datetime, date, timedelta, timezone
 from functools import wraps
 
 from src.utils.dates import FILTER_DATE_MAX, FILTER_DATE_MIN, to_utc_naive
-from src.utils.request_body import optional_json_object
+from src.utils.request_body import (flag_fields, id_args_error, json_body, json_object_body, is_db_id, is_int_list,
+                                    parse_flag, str_field)
 from typing import Optional
 
 from flask import Blueprint, jsonify, request, current_app, send_file, redirect
@@ -36,7 +37,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from src.database import db
-from src.services.recording_state import get_user_archived, set_user_archived, parse_archived_flag
+from src.services.recording_state import get_user_archived, set_user_archived
 from src.models import Recording, User, Tag, RecordingTag, Speaker, Event, TranscriptTemplate
 from src.models.processing_job import ProcessingJob
 from src.models.token_usage import TokenUsage
@@ -54,7 +55,7 @@ from src.utils.token_auth import load_user_from_token_value
 from src.utils.localization import api_error, translate
 from src.utils.error_text import log_failure
 from src.utils.metadata_limits import PARTICIPANTS_MAX_CHARS, metadata_error
-from src.utils.assistant_limits import MAX_QUESTION_CHARS, checked_history, question_error
+from src.utils.assistant_limits import MAX_QUESTION_CHARS, checked_history, checked_question
 from src.utils.route_errors import unexpected_error_body
 
 # Create blueprint with /api/v1 prefix
@@ -1229,8 +1230,9 @@ def get_capabilities():
     features = dict(CAPABILITY_FEATURES)
     from src.models import SystemSetting
     features['internal_sharing'] = bool(SystemSetting.get_setting('enable_internal_sharing', os.environ.get('ENABLE_INTERNAL_SHARING', 'false').lower() == 'true'))
-    features['public_sharing'] = bool(SystemSetting.get_setting('enable_public_sharing', os.environ.get('ENABLE_PUBLIC_SHARING', 'true').lower() == 'true'))
-    features['can_share_publicly'] = bool(features['public_sharing'] and getattr(current_user, 'can_share_publicly', True))
+    from src.services.public_shares import public_sharing_enabled, user_can_share_publicly
+    features['public_sharing'] = public_sharing_enabled()
+    features['can_share_publicly'] = user_can_share_publicly(current_user, features['public_sharing'])
     features['can_create_groups'] = _can_create_groups(current_user)
     from src.services.search_v1 import semantic_available
     features['search'] = {'keyword': True, 'semantic': semantic_available()}
@@ -1401,6 +1403,30 @@ def _recording_list_item(r, refs=None, shared=None):
     } if shared is None else dict(_recording_list_item(r, refs), **shared)
 
 
+def _list_etag(response, total):
+    """Weak ETag and If-None-Match for a page of GET /recordings (D#662).
+
+    The tag holds the caller, every query parameter (page, per_page, sort,
+    filters), the total and a hash of the page as sent, so a change to any
+    recording on the page, to the page's order or to the number of matches
+    gives a new tag. It is set on the finished answer, so the scope and
+    access checks and the parameter checks come first: a refused request
+    gets its error, never 304.
+    """
+    import hashlib
+    from flask import make_response
+    from src.services.recording_changes import etag_matches
+    params = '&'.join(f'{key}={value}' for key, value in sorted(request.args.items(multi=True)))
+    key = hashlib.sha1(f'{current_user.id}|{params}|{total}'.encode('utf-8')).hexdigest()[:12]
+    digest = hashlib.sha1(response.get_data()).hexdigest()[:16]
+    etag = f'W/"rl{current_user.id}-{key}-{digest}"'
+    if etag_matches(request, etag):
+        response = make_response('', 304)
+    response.headers['ETag'] = etag
+    response.headers['Cache-Control'] = 'private, no-cache'
+    return response
+
+
 @api_v1_bp.route('/recordings', methods=['GET'])
 @require_scope('read')
 @login_required
@@ -1427,6 +1453,10 @@ def list_recordings():
         date_field: What date_from and date_to filter: created_at (default)
                     or meeting_date
     """
+    # An id or page past the column range names nothing: 400 (#664)
+    arg_error = id_args_error(('tag_id', 'folder_id', 'owner_id', 'page', 'per_page'))
+    if arg_error:
+        return arg_error
     # Parse query parameters
     page = request.args.get('page', 1, type=int)
     per_page = min(request.args.get('per_page', 25, type=int), 100)
@@ -1617,7 +1647,7 @@ def list_recordings():
     recordings = [_recording_list_item(r, page_refs.get(r.id, []), page_shared.get(r.id))
                   for r in pagination.items]
 
-    return jsonify({
+    response = jsonify({
         'recordings': recordings,
         'pagination': {
             'page': pagination.page,
@@ -1628,6 +1658,7 @@ def list_recordings():
             'has_prev': pagination.has_prev
         }
     })
+    return _list_etag(response, pagination.total)
 
 
 # =============================================================================
@@ -1677,6 +1708,10 @@ def search_recordings_v1():
     page (keyword mode).
     """
     from src.services import search_v1
+    # An id or page past the column range names nothing: 400 (#664)
+    arg_error = id_args_error(('tag_id', 'folder_id', 'recording_ids', 'page', 'limit'))
+    if arg_error:
+        return arg_error
     args = request.args
     q = (args.get('q') or '').strip()
     if not 2 <= len(q) <= 500:
@@ -1788,10 +1823,12 @@ def replace_external_refs(recording_id):
     if err:
         return err
     system = request.args.get('system', '')
-    body = request.get_json(silent=True) or {}
+    body, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     try:
         if not xr._SLUG.match(system):
-            raise xr.RefError('?system= is required')
+            raise xr.RefError('external_ref_system_required')
         xr.replace_system(recording, current_user.id, system, xr.validate_list(body.get('external_refs')))
     except xr.RefError as e:
         db.session.rollback()
@@ -1823,9 +1860,8 @@ def delete_external_ref(recording_id, ref_id):
 def create_public_share(recording_id):
     """Create or reuse a public link (mailr spec G10). Notes are not shared
     unless asked, and a reused link's flags change only with update_existing."""
-    from src.services.public_shares import get_or_create, link_is_https, public_url, share_dict
-    from src.models import SystemSetting
-    if not bool(SystemSetting.get_setting('enable_public_sharing', os.environ.get('ENABLE_PUBLIC_SHARING', 'true').lower() == 'true')):
+    from src.services.public_shares import get_or_create, link_is_https, public_sharing_enabled, public_url, share_dict
+    if not public_sharing_enabled():
         return jsonify({'error': translate('server.apiError.public_sharing_off'), 'code': 'feature_disabled'}), 403
     if not getattr(current_user, 'can_share_publicly', True):
         return jsonify({'error': translate('server.apiError.public_link_not_permitted'), 'code': 'not_permitted'}), 403
@@ -1834,7 +1870,9 @@ def create_public_share(recording_id):
     recording = db.session.get(Recording, recording_id)
     if not recording or recording.user_id != current_user.id:
         return jsonify({'error': translate('server.apiError.recording_not_found'), 'code': 'not_found'}), 404
-    data = request.get_json(silent=True) or {}
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     flags = {}
     for key, default in (('share_summary', True), ('share_notes', False), ('force_new', False),
                          ('update_existing', False)):
@@ -1900,6 +1938,9 @@ def list_recording_changes():
     from src.services.recording_changes import (CursorError, cursor_expired, decode_cursor,
                                                 iso_z, read_changes)
     cursor = request.args.get('cursor') or None
+    arg_error = id_args_error(('limit',))
+    if arg_error:
+        return arg_error
     limit = request.args.get('limit', 100, type=int)
     if limit is None or not 1 <= limit <= 500:
         return jsonify({'error': translate('server.apiError.invalid_limit'), 'code': 'invalid_parameter'}), 400
@@ -2038,6 +2079,9 @@ def get_transcript(recording_id):
         translation: true/1/yes renders the stored translation instead
         template_id: format=text only, one of the user's transcript templates
     """
+    arg_error = id_args_error(('template_id',))
+    if arg_error:
+        return arg_error
     recording = db.session.get(Recording, recording_id)
     if not recording or not has_recording_access(recording, current_user):
         return jsonify(api_error('recording_not_found')), 404
@@ -2209,9 +2253,13 @@ def update_recording(recording_id):
     if not has_recording_access(recording, current_user, require_edit=True):
         return jsonify(api_error('permission_denied')), 403
 
-    data = request.get_json()
+    data, body_error = json_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
+    if not isinstance(data, dict):
+        return jsonify(api_error('body_must_be_object')), 400
 
     # `keep_audio_only` is set at upload time and dictates whether the
     # processing pipeline retained the video stream. Allowing PATCH to
@@ -2229,6 +2277,15 @@ def update_recording(recording_id):
                                   'summary': recording.summary})
     if error:
         return jsonify(error), 400
+    # An id, or null to leave the folder; a list or a string is not one,
+    # and an id past the column range names no folder (#664, #677)
+    if data.get('folder_id') is not None and not is_db_id(data['folder_id']):
+        return jsonify(api_error('invalid_folder_id')), 400
+    # true/false, "true"/"false" or 0/1; anything else is refused before
+    # the first change, never cast with bool() (#665, #674)
+    flags, flag_error = flag_fields(data, ('is_inbox', 'is_highlighted', 'is_archived'))
+    if flag_error:
+        return flag_error
 
     # Update fields if provided
     if 'title' in data:
@@ -2253,22 +2310,19 @@ def update_recording(recording_id):
                 recording.meeting_date = to_utc_naive(datetime.fromisoformat(data['meeting_date'].replace('Z', '+00:00')))
             else:
                 recording.meeting_date = None
-        except ValueError:
+        except (ValueError, TypeError, AttributeError):
             return jsonify(api_error('invalid_meeting_date')), 400
-    if 'is_inbox' in data or 'is_highlighted' in data:
+    if 'is_inbox' in flags or 'is_highlighted' in flags:
         # Inbox and star are per user: a shared editor sets their own (#599)
         set_user_recording_status(
             recording, current_user,
-            is_inbox=bool(data['is_inbox']) if 'is_inbox' in data else None,
-            is_highlighted=bool(data['is_highlighted']) if 'is_highlighted' in data else None,
+            is_inbox=flags.get('is_inbox'),
+            is_highlighted=flags.get('is_highlighted'),
             commit=False)
-    if 'is_archived' in data:
-        archived = parse_archived_flag(data['is_archived'])
-        if archived is None:
-            return jsonify(api_error('invalid_is_archived')), 400
+    if 'is_archived' in flags:
         # Per user, like the web app: a shared editor archives it for
         # themselves only (#394).
-        set_user_archived(recording, current_user, archived, commit=False)
+        set_user_archived(recording, current_user, flags['is_archived'], commit=False)
     if 'folder_id' in data:
         new_folder_id = data['folder_id']
         if new_folder_id is None:
@@ -2328,8 +2382,10 @@ def replace_notes(recording_id):
     if not recording or not has_recording_access(recording, current_user):
         return jsonify(api_error('recording_not_found')), 404
 
-    data = request.get_json()
-    if not data or 'notes' not in data:
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    if 'notes' not in data:
         return jsonify(api_error('notes_field_required')), 400
     error = metadata_error({'notes': data['notes']}, {'notes': recording.get_user_notes(current_user)})
     if error:
@@ -2357,8 +2413,10 @@ def replace_summary(recording_id):
     if not has_recording_access(recording, current_user, require_edit=True):
         return jsonify(api_error('permission_denied')), 403
 
-    data = request.get_json()
-    if not data or 'summary' not in data:
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    if 'summary' not in data:
         return jsonify(api_error('summary_field_required')), 400
     error = metadata_error({'summary': data['summary']}, {'summary': recording.summary})
     if error:
@@ -2574,9 +2632,19 @@ def create_tag():
     """Create a new tag."""
     from src.models.organization import GroupMembership
 
-    data = request.get_json()
-    if not data or not data.get('name'):
-        return jsonify(api_error('tag_name_required')), 400
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    from src.api.tags import clean_tag_name
+    # A string of at most 50 characters, stripped, as on the web (#682)
+    name, name_error = clean_tag_name(data.get('name'))
+    if name_error:
+        return name_error
+    data['name'] = name
+    from src.utils.request_body import PROCESSING_FIELDS, clean_fields, id_fields_error
+    fields_error = id_fields_error(data, ('group_id',)) or clean_fields(data, PROCESSING_FIELDS)
+    if fields_error:
+        return fields_error
 
     group_id = data.get('group_id')
 
@@ -2653,9 +2721,22 @@ def update_tag(tag_id):
         if tag.user_id != current_user.id:
             return jsonify(api_error('permission_denied')), 403
 
-    data = request.get_json()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
+    if 'name' in data:
+        from src.api.tags import clean_tag_name
+        # A string of at most 50 characters, stripped, as on the web (#682)
+        name, name_error = clean_tag_name(data['name'])
+        if name_error:
+            return name_error
+        data['name'] = name
+    from src.utils.request_body import PROCESSING_FIELDS, clean_fields, id_fields_error
+    fields_error = id_fields_error(data, ('group_id',)) or clean_fields(data, PROCESSING_FIELDS)
+    if fields_error:
+        return fields_error
     from src.services.auto_shares import regroup_error, regroup_name_error, share_scope_refusal, sharing_state, sync_source_shares
     before = sharing_state(tag)
 
@@ -2800,15 +2881,21 @@ def add_tags_to_recording(recording_id):
     if not has_recording_access(recording, current_user, require_edit=True):
         return jsonify(api_error('permission_denied')), 403
 
-    data = optional_json_object()
-    tag_ids = data.get('tag_ids', [])
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
+    # The same rule as PUT: a list of integer ids, a boolean is not one (#657)
+    tag_ids = data.get('tag_ids')
+    if tag_ids is not None and not is_int_list(tag_ids):
+        return jsonify({'error': translate('server.apiError.invalid_tag_ids_list'), 'code': 'invalid_parameter'}), 400
     if not tag_ids:
         # Support single tag_id for backward compatibility
         tag_id = data.get('tag_id')
-        if tag_id:
-            tag_ids = [tag_id]
-        else:
+        if tag_id is None:
             return jsonify(api_error('tag_ids_required')), 400
+        if not is_db_id(tag_id):
+            return jsonify({'error': translate('server.apiError.invalid_integer_value'), 'code': 'invalid_parameter'}), 400
+        tag_ids = [tag_id]
 
     errors = []
     to_add = []
@@ -2858,9 +2945,11 @@ def replace_recording_tags(recording_id):
         return jsonify({'error': translate('server.apiError.recording_not_found'), 'code': 'not_found'}), 404
     if not has_recording_access(recording, current_user, require_edit=True):
         return jsonify(api_error('permission_denied')), 403
-    data = request.get_json(silent=True) or {}
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     tag_ids = data.get('tag_ids')
-    if not isinstance(tag_ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) for t in tag_ids):
+    if not is_int_list(tag_ids):
         return jsonify({'error': translate('server.apiError.invalid_tag_ids_list'), 'code': 'invalid_parameter'}), 400
     wanted, bad = [], []
     for tag_id in dict.fromkeys(tag_ids):
@@ -3216,11 +3305,13 @@ def _speaker_contact_fields(data, speaker):
 @login_required
 def create_speaker():
     """Create a new speaker (name, optional email and aliases)."""
-    data = request.get_json()
-    if not data or not data.get('name'):
-        return jsonify(api_error('speaker_name_required')), 400
-
-    name = data['name'].strip()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    # A non-blank string: "   " is no name, null or a number not one (#680)
+    name, name_error = str_field(data, 'name', 'speaker_name_required')
+    if name_error:
+        return name_error
     if is_generic_speaker_label(name):
         return jsonify({'error': translate('server.apiError.speaker_name_generic'), 'code': 'invalid_parameter'}), 400
     if speaker_name_too_long(name):
@@ -3262,7 +3353,9 @@ def update_speaker(speaker_id):
     if speaker.user_id != current_user.id:
         return jsonify(api_error('permission_denied')), 403
 
-    data = request.get_json()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
 
@@ -3273,8 +3366,9 @@ def update_speaker(speaker_id):
 
     renamed = {}
     if 'name' in data:
-        new_name = (data.get('name') or '').strip()
-        if not new_name:
+        # A non-blank string; null or a number is refused, not stripped (#680)
+        new_name, name_error = str_field(data, 'name', 'speaker_name_empty')
+        if name_error:
             db.session.rollback()
             return jsonify({'error': translate('server.apiError.speaker_name_empty'), 'code': 'invalid_parameter'}), 400
         if is_generic_speaker_label(new_name):
@@ -3432,7 +3526,9 @@ def assign_speakers(recording_id):
         if not has_recording_access(recording, current_user, require_edit=True):
             return jsonify(api_error('permission_denied')), 403
 
-        data = request.get_json()
+        data, body_error = json_object_body()
+        if body_error:
+            return body_error
         if not data or 'speaker_map' not in data:
             return jsonify(api_error('speaker_map_required')), 400
 
@@ -3553,7 +3649,9 @@ def start_transcription(recording_id):
 
     # Same checks, clearing and settings as the web reprocess (#412).
     from src.services.reprocessing import queue_transcription_reprocess, ReprocessError
-    data = optional_json_object()
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     overrides = {
         'min_speakers': data.get('min_speakers'),
         'max_speakers': data.get('max_speakers'),
@@ -3594,7 +3692,9 @@ def start_summarization(recording_id):
     # Same checks, clearing and parameters as the web reprocess, including
     # prompt_mode and prompt_variables (#412).
     from src.services.reprocessing import queue_summary_reprocess, ReprocessError
-    data = optional_json_object()
+    data, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
     try:
         job_id = queue_summary_reprocess(recording, current_user,
                                          custom_prompt=data.get('custom_prompt'),
@@ -3622,7 +3722,8 @@ def start_summarization(recording_id):
 def chat_with_recording(recording_id):
     """Chat about a recording's content. with_sources: true returns numbered
     sources with segment, time, speaker and a checked quote (mailr spec G9)."""
-    from src.services.llm import chat_client, call_chat_completion
+    from src.services import llm_config
+    from src.services.llm import call_chat_completion
     from src.services.citations import parse_sources
     from src.services.recording_chat import build_chat_messages
 
@@ -3633,12 +3734,14 @@ def chat_with_recording(recording_id):
     if not recording.transcription:
         return jsonify(api_error('no_transcription')), 400
 
-    data = request.get_json()
-    if not data or not data.get('message') or not isinstance(data.get('message'), str):
-        return jsonify(api_error('message_required')), 400
-    too_long = question_error(data['message'], v1=True)
-    if too_long:
-        return jsonify(too_long), 400
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
+    # Stripped; blank or holding NUL is no question (#670)
+    message, message_error = checked_question(data.get('message'), api_error('message_required'), v1=True)
+    if message_error:
+        return jsonify(message_error), 400
+    data = dict(data, message=message)
     history, bad_history = checked_history(data.get('conversation_history'), v1=True)
     if bad_history:
         return jsonify(bad_history), 400
@@ -3647,8 +3750,8 @@ def chat_with_recording(recording_id):
     if not isinstance(with_sources, bool):
         return jsonify({'error': translate('server.apiError.invalid_with_sources'), 'code': 'invalid_parameter'}), 400
 
-    # Check if chat client is available
-    if chat_client is None:
+    # Check if a chat model is available, resolved for this request.
+    if not llm_config.is_configured('chat'):
         return jsonify(api_error('chat_unavailable')), 503
 
     messages, segments = build_chat_messages(recording, current_user, data['message'],
@@ -3683,14 +3786,15 @@ def inquire_v1():
     from src.services.recording_scope import scope_condition
     if os.environ.get('ENABLE_INQUIRE_MODE', 'false').lower() != 'true':
         return jsonify({'error': translate('server.apiError.inquire_off'), 'code': 'feature_disabled'}), 403
-    body = request.get_json(silent=True) or {}
-    question = body.get('question')
-    question = question.strip() if isinstance(question, str) else ''
-    if not question:
-        return jsonify({'error': translate('server.apiError.question_required'), 'code': 'invalid_parameter'}), 400
-    too_long = question_error(question, v1=True)
-    if too_long:
-        return jsonify(too_long), 400
+    body, body_error = json_object_body(optional=True)
+    if body_error:
+        return body_error
+    # Stripped; blank or holding NUL is no question (#670)
+    question, question_problem = checked_question(
+        body.get('question'),
+        {'error': translate('server.apiError.question_required'), 'code': 'invalid_parameter'}, v1=True)
+    if question_problem:
+        return jsonify(question_problem), 400
     history, bad_history = checked_history(body.get('history'), v1=True)
     if bad_history:
         return jsonify(bad_history), 400
@@ -3702,7 +3806,10 @@ def inquire_v1():
     scope = body.get('scope', 'own')
     if scope not in ('own', 'shared', 'all'):
         return jsonify({'error': translate('server.apiError.invalid_scope'), 'code': 'invalid_parameter'}), 400
-    filters = body.get('filters') or {}
+    # Only a missing or null filters is no filter; [], "" or 0 is refused (#668)
+    filters = body.get('filters')
+    if filters is None:
+        filters = {}
     if not isinstance(filters, dict):
         return jsonify({'error': translate('server.apiError.invalid_filters'), 'code': 'invalid_parameter'}), 400
     # The filters in the form of the web routes, with the same checks (#627)
@@ -3898,7 +4005,9 @@ def download_audio(recording_id):
 @login_required
 def batch_update_recordings():
     """Batch update multiple recordings."""
-    data = request.get_json()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
 
@@ -3907,6 +4016,18 @@ def batch_update_recordings():
 
     if not recording_ids:
         return jsonify(api_error('recording_ids_required')), 400
+    # Every id and every update is checked before the first change (#666)
+    if not is_int_list(recording_ids):
+        return jsonify(api_error('invalid_recording_ids_list')), 400
+    if not isinstance(updates, dict):
+        return jsonify(api_error('invalid_updates')), 400
+    for key in ('add_tag_ids', 'remove_tag_ids'):
+        if key in updates and not is_int_list(updates[key]):
+            return jsonify(api_error('invalid_tag_ids')), 400
+    # The same flag reading as the single PATCH (#665, #674)
+    flags, flag_error = flag_fields(updates, ('is_inbox', 'is_highlighted', 'is_archived'))
+    if flag_error:
+        return flag_error
 
     # If folder_id is being set on the batch, validate target folder access
     # once up front. The same destination folder applies to every recording
@@ -3915,6 +4036,8 @@ def batch_update_recordings():
     target = None
     if 'folder_id' in updates:
         new_folder_id = updates['folder_id']
+        if new_folder_id is not None and not is_db_id(new_folder_id):
+            return jsonify(api_error('invalid_folder_id')), 400
         if new_folder_id is not None:
             from src.models.organization import Folder, GroupMembership
             target = db.session.get(Folder, new_folder_id)
@@ -3930,12 +4053,6 @@ def batch_update_recordings():
                 if not membership:
                     return jsonify(api_error('target_folder_access_denied')), 403
             target_folder_id = new_folder_id
-
-    batch_archived = None
-    if 'is_archived' in updates:
-        batch_archived = parse_archived_flag(updates['is_archived'])
-        if batch_archived is None:
-            return jsonify(api_error('invalid_is_archived')), 400
 
     results = []
     for recording_id in recording_ids:
@@ -3956,15 +4073,15 @@ def batch_update_recordings():
                 continue
 
         try:
-            if 'is_inbox' in updates or 'is_highlighted' in updates:
+            if 'is_inbox' in flags or 'is_highlighted' in flags:
                 # Per user, as on the single PATCH (#599)
                 set_user_recording_status(
                     recording, current_user,
-                    is_inbox=bool(updates['is_inbox']) if 'is_inbox' in updates else None,
-                    is_highlighted=bool(updates['is_highlighted']) if 'is_highlighted' in updates else None,
+                    is_inbox=flags.get('is_inbox'),
+                    is_highlighted=flags.get('is_highlighted'),
                     commit=False)
-            if 'is_archived' in updates:
-                set_user_archived(recording, current_user, batch_archived, commit=False)
+            if 'is_archived' in flags:
+                set_user_archived(recording, current_user, flags['is_archived'], commit=False)
             if 'folder_id' in updates:
                 # `target_folder_id` already validated above (None to remove,
                 # or a valid folder id the caller has access to).
@@ -4063,13 +4180,18 @@ def batch_update_recordings():
 @audit.emits('recording.deleted')
 def batch_delete_recordings():
     """Batch delete multiple recordings."""
-    data = request.get_json()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
 
     recording_ids = data.get('recording_ids', [])
     if not recording_ids:
         return jsonify(api_error('recording_ids_required')), 400
+    # A list of ids, every item checked before the first change (#666)
+    if not is_int_list(recording_ids):
+        return jsonify(api_error('invalid_recording_ids_list')), 400
 
     from src.models import SystemSetting
     USERS_CAN_DELETE = bool(SystemSetting.get_setting('users_can_delete', os.environ.get('USERS_CAN_DELETE', 'true').lower() == 'true'))
@@ -4116,13 +4238,18 @@ def batch_transcribe_recordings():
     """Batch queue transcriptions for multiple recordings."""
     from src.services.job_queue import job_queue
 
-    data = request.get_json()
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
     if not data:
         return jsonify(api_error('no_data_provided')), 400
 
     recording_ids = data.get('recording_ids', [])
     if not recording_ids:
         return jsonify(api_error('recording_ids_required')), 400
+    # A list of ids, every item checked before the first change (#666)
+    if not is_int_list(recording_ids):
+        return jsonify(api_error('invalid_recording_ids_list')), 400
 
     results = []
     for recording_id in recording_ids:
@@ -4164,15 +4291,18 @@ def batch_transcribe_recordings():
 @login_required
 def update_auto_summarization():
     """Toggle auto-summarization for the current user."""
-    data = request.get_json()
-
-    if data is None:
-        return jsonify(api_error('invalid_json')), 400
+    data, body_error = json_object_body()
+    if body_error:
+        return body_error
 
     if 'enabled' not in data:
         return jsonify(api_error('enabled_field_required')), 400
 
-    current_user.auto_summarization = bool(data['enabled'])
+    # "false" is false, not the truthy string it is to bool() (#665)
+    enabled = parse_flag(data['enabled'])
+    if enabled is None:
+        return jsonify(api_error('invalid_boolean_flag', key='enabled')), 400
+    current_user.auto_summarization = enabled
     db.session.commit()
 
     return jsonify({
@@ -4328,7 +4458,8 @@ def upload_recording():
         except ValueError as e:
             code = getattr(e, 'code', 'invalid_parameter')
             status = getattr(e, 'status', 400)
-            return jsonify({'error': str(e) if isinstance(e, xr.RefError) else 'external_refs must be JSON',
+            return jsonify({'error': str(e) if isinstance(e, xr.RefError)
+                            else translate('server.apiError.external_refs_not_json'),
                             'code': code}), status
     key = (form.get('idempotency_key') or '').strip() or None
     if key is not None and len(key) > 100:

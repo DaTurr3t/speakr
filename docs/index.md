@@ -6,10 +6,10 @@ Speakr is a powerful self-hosted transcription platform that helps you capture, 
   <img src="assets/images/screenshots/main-view.png" alt="Main Interface" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
 </div>
 
-!!! success "Latest Release: v0.11.1: User table sorting, audit log refresh, file labels in the log"
-    Every column of the user management table can be sorted, the audit log has a Refresh button and snapshot exports, and every file in the log has an identifier.
+!!! success "Latest Release: v0.11.4: Trimming, language models in the admin panel, system audio offline"
+    A recording can be trimmed in the segment editor, with the transcript cut to match. Admins can configure text, chat and translation models in System settings without a restart, and the offline recording page can record system audio.
 
-    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.11.1) for details.
+    See the [full release notes](https://github.com/murtaza-nasir/speakr/releases/tag/v0.11.4) for details.
 
 ## Quick Navigation
 
