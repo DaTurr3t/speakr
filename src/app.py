@@ -20,45 +20,26 @@ if __name__ == '__main__':
 
 import os
 import sys
-from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash, Response, make_response, session
-from urllib.parse import urlparse, urljoin, quote
-from email.utils import encode_rfc2231
-from markupsafe import Markup
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, request, jsonify, send_file, redirect, url_for, flash, session, current_app, abort
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
-from openai import OpenAI # Keep using the OpenAI library
-import json
-from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.routing import IntegerConverter
 from src.utils.request_body import DB_INT_MAX
-from sqlalchemy import select
-from sqlalchemy.orm import joinedload
-import threading
 from dotenv import load_dotenv # Import load_dotenv
-import httpx 
 import re
-import subprocess
 import mimetypes
-import bleach
 
 # Add common audio MIME type mappings that might be missing
 from src.utils.mime import SPEAKR_MEDIA_TYPES
 for _media_type, _media_ext in SPEAKR_MEDIA_TYPES:
     mimetypes.add_type(_media_type, _media_ext)
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_login import LoginManager, current_user
 from flask_bcrypt import Bcrypt
-from flask_wtf import FlaskForm
 from flask_wtf.csrf import CSRFProtect, CSRFError
-from wtforms import StringField, PasswordField, SubmitField, BooleanField
-from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import ast
 import logging
-import secrets
-import time
-from src.audio_chunking import AudioChunkingService, ChunkProcessingError, ChunkingNotSupportedError
 from src.utils.localization import api_error, format_number, translate
 
 # Optional imports for embedding functionality
@@ -67,7 +48,7 @@ try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
     EMBEDDINGS_AVAILABLE = True
-except ImportError as e:
+except ImportError:
     EMBEDDINGS_AVAILABLE = False
     # Create dummy classes to prevent import errors
     class SentenceTransformer:
@@ -603,42 +584,34 @@ register_change_tracking()
 
 # Import all models from extracted modules
 from src.models import (
-    User, Speaker, Recording, TranscriptChunk, Share, InternalShare,
-    SharedRecordingState, Group, GroupMembership, Tag, RecordingTag,
-    Event, TranscriptTemplate, InquireSession, SystemSetting, PushSubscription,
-    APIToken, NamingTemplate, Folder, SpeakerSnippet, ShareAuditLog,
-    ProcessingJob, TokenUsage, TranscriptionUsage
+    User, InternalShare,
+    SharedRecordingState, GroupMembership, Tag, RecordingTag,
+    SystemSetting
 )
 
-# Import utility functions from extracted modules
-from src.utils import (
-    auto_close_json, safe_json_loads, preprocess_json_escapes, extract_json_object,
-    md_to_html, sanitize_html, password_check,
-    add_column_if_not_exists, is_safe_url
+# Re-exports kept for tests and scripts that import them from src.app. The
+# repeated name marks each one as a deliberate re-export, so F401 stays clean.
+from src.models import (
+    InquireSession as InquireSession,
+    Recording as Recording,
+    TranscriptChunk as TranscriptChunk,
 )
-
-# Import service layer functions
 from src.services.embeddings import (
-    get_embedding_model, generate_embeddings,
-    serialize_embedding, deserialize_embedding, get_accessible_recording_ids,
-    process_recording_chunks, basic_text_search_chunks, semantic_search_chunks
+    deserialize_embedding as deserialize_embedding,
+    generate_embeddings as generate_embeddings,
+    process_recording_chunks as process_recording_chunks,
+    serialize_embedding as serialize_embedding,
 )
-from src.transcript_chunking import chunk_transcription
-from src.services.llm import (
-    is_gpt5_model, is_using_openai_api, call_llm_completion, format_api_error_message
+from src.transcript_chunking import chunk_transcription as chunk_transcription
+from src.utils import (
+    extract_json_object as extract_json_object,
+    preprocess_json_escapes as preprocess_json_escapes,
+    safe_json_loads as safe_json_loads,
 )
-from src.services.document import process_markdown_to_docx
-from src.services.retention import (
-    is_recording_exempt_from_deletion, get_retention_days_for_recording, process_auto_deletion
-)
-from src.services.calendar import generate_ics_content, escape_ical_text
 
-# Import background task functions
-from src.tasks.processing import (
-    generate_title_task, generate_summary_only_task, extract_events_from_transcript,
-    extract_audio_from_video, transcribe_audio_task, transcribe_with_connector,
-    transcribe_chunks_with_connector, transcribe_incognito
-)
+# The task module is loaded at startup, as before, so an import error in it
+# fails the start instead of the first job a worker picks up.
+import src.tasks.processing  # noqa: F401,E402
 
 # Import configuration helpers
 from src.config.version import get_version
@@ -790,23 +763,6 @@ def exempt_status_endpoints():
             return True
     return False
 
-csrf = CSRFProtect(app)
-
-# Disable Flask-WTF's automatic CSRF check so we can run our own
-# token-aware version below. The replacement still calls csrf.protect()
-# for browser/session requests; the bypass only fires when a valid
-# API token is presented via header (never query string).
-#
-# GHSA-x4q4-3ww4-h329 (Irina Iarlykanova): the previous
-# ``csrf_exempt_for_api_tokens`` hook called ``csrf.exempt(view_func)``
-# from a request handler. That mutates Flask-WTF's process-global
-# ``_exempt_views`` set permanently, so any cross-origin request with
-# ``?token=anything`` would silently disable CSRF on the targeted
-# endpoint for the rest of the worker's lifetime, allowing follow-up
-# CSRF attacks. Replaced with a per-request decision below.
-app.config['WTF_CSRF_CHECK_DEFAULT'] = False
-
-
 @app.before_request
 def record_last_active():
     """Note the time of this use of the signed-in account (admin user list).
@@ -852,77 +808,78 @@ def refuse_query_token_writes():
         return resp
 
 
-@app.before_request
-def csrf_token_aware_check():
-    """Per-request CSRF check that allows valid header-only API tokens
-    to bypass CSRF, without ever mutating Flask-WTF's exemption set.
+class TokenAwareCSRFProtect(CSRFProtect):
+    """Flask-WTF's CSRF protection, with a per-request bypass for valid
+    header-only API tokens.
 
-    The check honours all the registration-time exemptions Flask-WTF
-    already knows about (``csrf.exempt(blueprint)`` and
-    ``csrf.exempt(view_func)`` called at module load time), and only
-    skips CSRF for the specific request currently being handled.
+    Flask-WTF's own before_request hook (WTF_CSRF_CHECK_DEFAULT, on) runs
+    the check, so CSRF protection does not depend on a hook of this
+    application (#690). Only the two decisions below are changed.
 
-    Tokens are accepted only from the Authorization, X-API-Token, and
-    API-Token headers. The query-string token is intentionally NOT
-    honoured here because a Simple Cross-Origin Request can carry one
-    without triggering CORS preflight, which is exactly the attack
-    vector in GHSA-x4q4-3ww4-h329.
+    GHSA-x4q4-3ww4-h329 (Irina Iarlykanova): an earlier hook called
+    ``csrf.exempt(view_func)`` from a request handler, which mutated
+    Flask-WTF's process-global ``_exempt_views`` set for the rest of the
+    worker's lifetime, so any cross-origin request with ``?token=anything``
+    disabled CSRF on its endpoint. The bypass is a per-request decision
+    and never changes the exemption sets.
     """
-    if not app.config.get('WTF_CSRF_ENABLED', True):
-        return
-    if request.method not in app.config.get(
-        'WTF_CSRF_METHODS', {'POST', 'PUT', 'PATCH', 'DELETE'}
-    ):
-        return
-    if not request.endpoint:
-        return
 
-    # Blueprint-level registration-time exemptions (e.g. api_v1_bp).
-    # Note that csrf._exempt_blueprints holds Blueprint OBJECTS, so we
-    # resolve the request's blueprint name through app.blueprints, the
-    # same way Flask-WTF's own protect() hook does.
-    #
-    # These exemptions exist for token clients. A request that carries a
-    # browser session or remember-me cookie is signed in by that cookie,
-    # so it still needs a CSRF token here, which the web UI sends (#478).
-    if app.blueprints.get(request.blueprint) in csrf._exempt_blueprints:
-        remember_cookie = app.config.get('REMEMBER_COOKIE_NAME', 'remember_token')
-        if not session.get('_user_id') and remember_cookie not in request.cookies:
+    def _is_exempt(self):
+        """The registration-time exemptions (``csrf.exempt(view)`` and
+        ``csrf.exempt(blueprint)`` at import time).
+
+        The exempt blueprints (api_v1_bp, webhooks_bp) exist for token
+        clients. A request that carries a browser session or remember-me
+        cookie is signed in by that cookie, so it still needs a CSRF token,
+        which the web UI sends (#478).
+        """
+        view = current_app.view_functions.get(request.endpoint)
+        if view is not None and f"{view.__module__}.{view.__name__}" in self._exempt_views:
+            return True
+        if current_app.blueprints.get(request.blueprint) in self._exempt_blueprints:
+            remember_cookie = current_app.config.get('REMEMBER_COOKIE_NAME', 'remember_token')
+            return not session.get('_user_id') and remember_cookie not in request.cookies
+        return False
+
+    def protect(self, apply_exemptions=False):
+        """Flask-WTF's check, skipped for a valid API token in a header.
+
+        Tokens are accepted only from the Authorization, X-API-Token and
+        API-Token headers. The query-string token is never honoured here,
+        because a Simple Cross-Origin Request can carry one without a CORS
+        preflight (GHSA-x4q4-3ww4-h329).
+        """
+        if apply_exemptions and (not request.endpoint or self._is_exempt()):
+            return
+        if request.method not in current_app.config['WTF_CSRF_METHODS']:
             return
 
-    # View-level registration-time exemptions (e.g. share_target).
-    # Flask-WTF identifies exempt views by f"{__module__}.{__name__}";
-    # match that exactly so any view registered via csrf.exempt() at
-    # import time is honoured here.
-    view = app.view_functions.get(request.endpoint)
-    if view is not None:
-        dest = f"{view.__module__}.{view.__name__}"
-        if dest in csrf._exempt_views:
+        # A valid header API token comes from a programmatic client, and
+        # CSRF does not apply. The token is validated against the DB.
+        from src.utils.token_auth import extract_token_from_request, load_user_from_token_headers_only
+        if load_user_from_token_headers_only() is not None:
             return
 
-    # If a valid header API token is presented, this request is from a
-    # programmatic client and CSRF does not apply. The token is validated
-    # against the DB by load_user_from_token_headers_only().
-    from src.utils.token_auth import extract_token_from_request, load_user_from_token_headers_only
-    if load_user_from_token_headers_only() is not None:
-        return
+        # A token in a header that is not valid (unknown, expired or revoked)
+        # comes from a programmatic client, which needs to hear that its
+        # credentials failed: 401, not a CSRF 400 (#672). The request is
+        # refused either way, so no check is skipped. A browser session keeps
+        # the CSRF check, and a request without any credentials (a login or
+        # register form among them) still gets it too.
+        if extract_token_from_request(headers_only=True) and not session.get('_user_id'):
+            resp = jsonify(api_error('authentication_required'))
+            resp.status_code = 401
+            resp.headers['WWW-Authenticate'] = 'Bearer error="invalid_token"'
+            abort(resp)
 
-    # A token in a header that is not valid (unknown, expired or revoked)
-    # comes from a programmatic client, which needs to hear that its
-    # credentials failed: 401, not a CSRF 400 (#672). The request is
-    # refused either way, so no check is skipped. A browser session keeps
-    # the CSRF check, and a request without any credentials (a login or
-    # register form among them) still gets it too.
-    if extract_token_from_request(headers_only=True) and not session.get('_user_id'):
-        resp = jsonify(api_error('authentication_required'))
-        resp.status_code = 401
-        resp.headers['WWW-Authenticate'] = 'Bearer error="invalid_token"'
-        return resp
+        # The standard check. A failure raises CSRFError, which
+        # handle_csrf_error below turns into a 400 response.
+        super().protect(apply_exemptions=False)
 
-    # Otherwise, fall through to the standard CSRF check. If validation
-    # fails, csrf.protect() raises a CSRFError which Flask-WTF's error
-    # handler turns into a 400 response.
-    csrf.protect()
+
+# Registered here, so its before_request hook runs after record_last_active
+# and refuse_query_token_writes, as the check of this application did.
+csrf = TokenAwareCSRFProtect(app)
 
 
 @app.before_request
@@ -1150,7 +1107,6 @@ def inject_help_center_link():
     Admins hosting their own FAQ/tutorial page set HELP_CENTER_URL (and
     optionally HELP_CENTER_LABEL) to surface it prominently for users.
     """
-    from src.models import SystemSetting
     return {
         'help_center_url': (SystemSetting.get_setting('help_center_url', os.environ.get('HELP_CENTER_URL', '')) or '').strip(),
         'help_center_label': (SystemSetting.get_setting('help_center_label', os.environ.get('HELP_CENTER_LABEL', '')) or '').strip(),
@@ -1378,7 +1334,7 @@ csrf.exempt(_share_target_view)
 # File monitor and scheduler initialization functions below
 
 # Startup functions (extracted to src/config/startup.py)
-from src.config.startup import initialize_file_monitor, get_file_monitor_functions, initialize_auto_deletion_scheduler, run_startup_tasks
+from src.config.startup import run_startup_tasks
 
 # Run startup tasks
 run_startup_tasks(app)

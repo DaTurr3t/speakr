@@ -5,10 +5,8 @@ This blueprint handles user registration, login, logout, account management,
 and password changes.
 """
 
-import hmac
 import os
 import re
-import mimetypes
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, session, current_app, make_response
 from markupsafe import escape
 from flask_login import login_user, logout_user, login_required, current_user
@@ -16,7 +14,6 @@ from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SubmitField, BooleanField
 from wtforms.validators import DataRequired, Length, Email, EqualTo, ValidationError
 from email_validator import validate_email, EmailNotValidError
-from werkzeug.security import generate_password_hash, check_password_hash
 import markdown
 
 from src.database import db
@@ -30,8 +27,6 @@ from src.auth.sso import (
     get_sso_config,
     get_sso_client,
     create_or_update_sso_user,
-    is_domain_allowed,
-    link_sso_to_existing_user,
     resolve_userinfo,
     update_user_profile_from_claims,
 )
@@ -44,6 +39,7 @@ from src.services.email import (
     send_password_reset_email,
     verify_email_token,
     verify_reset_token,
+    stored_token_matches,
     can_resend_verification,
     can_resend_password_reset,
 )
@@ -639,6 +635,13 @@ def verify_email(token):
         flash(translate('server.flash.emailAlreadyVerified'), 'info')
         return redirect(url_for('auth.login'))
 
+    # Single use (#693): the link must belong to the hash of the latest
+    # verification token stored on the user. A used link (cleared below) or
+    # one replaced by a newer email no longer matches.
+    if not stored_token_matches(user.email_verification_token, token):
+        flash(translate('server.flash.verificationLinkInvalid'), 'danger')
+        return redirect(url_for('auth.login'))
+
     # Verify the email
     user.email_verified = True
     user.email_verification_token = None  # Clear the token
@@ -771,11 +774,10 @@ def reset_password(token):
 
     # Single-use enforcement: the itsdangerous token is only signature+expiry
     # checked, so on its own it stays replayable for the whole TTL even after
-    # it has been used or superseded. Bind it to the token currently stored on
-    # the user: a used token (cleared on reset) or one superseded by a newer
-    # reset request no longer matches and is rejected immediately.
-    stored_token = user.password_reset_token or ''
-    if not stored_token or not hmac.compare_digest(stored_token, token):
+    # it has been used or superseded. Bind it to the hash of the token stored
+    # on the user (#693): a used token (cleared on reset) or one superseded by
+    # a newer reset request no longer matches and is rejected immediately.
+    if not stored_token_matches(user.password_reset_token, token):
         flash(translate('server.flash.resetLinkInvalid'), 'danger')
         return redirect(url_for('auth.forgot_password'))
 
@@ -1152,9 +1154,6 @@ def account():
     # Check if admin has globally disabled auto-summarization or auto-translation
     admin_disabled_auto_summarization = _admin_disabled_setting('disable_auto_summarization', False)
     auto_translation_available = not _admin_disabled_setting('disable_auto_translation', True)
-    from src.models import SystemSetting as _SS
-    r=_SS.query.filter_by(key='disable_auto_translation').first()
-    from src.models.system import _SYSTEM_SETTING_CACHE_GENERATION
 
     # Get user's UI language preference
     user_language = current_user.ui_language if current_user.ui_language else 'en'

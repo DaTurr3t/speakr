@@ -280,9 +280,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The service worker is registered by js/service-worker-client.js, which
     // every signed-in page loads.
 
-    // Escapes text placed into the help markup returned by helpCode/helpLink.
-    const escapeHelpHtml = (text) => String(text)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    // The help markup returned by helpCode/helpLink escapes its text (#692).
+    const safeHtml = window.safeHtml;
 
     // Create a safe t function that's always available
     const safeT = (key, params = {}) => {
@@ -4181,14 +4180,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 return window.renderMarkdownSafe(customBanner.value);
             });
 
-            // Summary and notes of the open recording. The server's sanitized
-            // HTML is used when present; without it (a summary saved in this
-            // tab, an incognito recording) the markdown is rendered here and
-            // sanitized. The raw text is never used as HTML (#439).
+            // Summary and notes of the open recording. The server's HTML is
+            // used when present and sanitized again here, at the sink, like
+            // every other v-html value (#695); without it (a summary saved in
+            // this tab, an incognito recording) the markdown is rendered here
+            // and sanitized. The raw text is never used as HTML (#439).
             const renderedField = (field) => {
                 const rec = selectedRecording.value;
                 if (!rec) return '';
-                if (rec[field + '_html']) return rec[field + '_html'];
+                const serverHtml = rec[field + '_html'];
+                if (serverHtml) return window.sanitizeHtml(serverHtml);
                 return rec[field] ? window.renderMarkdownSafe(rec[field]) : '';
             };
             const summaryHtml = computed(() => renderedField('summary'));
@@ -5218,8 +5219,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 uiLocale: () => window.i18n?.getIntlLocale?.(),
                 // Markup for translated help text shown with v-html (the
                 // system-audio guide): a command or path, an external link.
-                helpCode: (text) => `<code style="background: var(--bg-tertiary); padding: 0 4px; border-radius: 3px;">${escapeHelpHtml(text)}</code>`,
-                helpLink: (href, label) => `<a href="${escapeHelpHtml(href)}" target="_blank" rel="noopener" style="color: var(--text-accent); text-decoration: underline;">${escapeHelpHtml(label)}</a>`,
+                helpCode: (text) => String(safeHtml`<code style="background: var(--bg-tertiary); padding: 0 4px; border-radius: 3px;">${text}</code>`),
+                helpLink: (href, label) => String(safeHtml`<a href="${href}" target="_blank" rel="noopener" style="color: var(--text-accent); text-decoration: underline;">${label}</a>`),
                 parseServerInstant,
                 formatDisplayDate,
                 formatShortDate,

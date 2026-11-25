@@ -34,7 +34,7 @@ To test the service setup behind #409 (no `PRELOAD_MODEL` in the service's
 
 It runs in two places:
 
-- `test.yml`, job `browser-smoke`: Speakr from source via `run_speakr.py`, after `PRODUCTION=1 python scripts/download_offline_deps.py`, exactly as the image build downloads the vendor files.
+- `test.yml`, jobs `browser-smoke-shards` (four shards, each with an instance of its own) and `browser-smoke` (passes when every shard passed): Speakr from source via `run_speakr.py`, after `PRODUCTION=1 python scripts/download_offline_deps.py`, exactly as the image build downloads the vendor files.
 - `docker-publish.yml`, job `smoke-lite`: the lite image, built for amd64 and started with `smoke_env.py`'s settings, before either image is pushed.
 
 By hand (Speakr running at the URL, with Playwright installed):
@@ -50,7 +50,7 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
 
 ### One instance for every browser test
 
-CI runs `tests/e2e/test_browser_smoke.py tests/e2e/test_*_ui.py` against one instance, in alphabetical order. Two rules keep the files independent of that order:
+CI splits `tests/e2e/test_browser_smoke.py tests/e2e/test_*_ui.py` into four shards with `shards.py` (`python tests/e2e/shards.py 2 4` prints the files of shard 2), by the measured time of each file; a new file joins a shard without an edit. Each shard runs its files against an instance of its own, the smoke test first and the others in alphabetical order; a run of all files by hand uses one instance. These rules keep the files independent of the order and of the files they share an instance with:
 
 - `run_speakr.py` starts the instance with `RATELIMIT_ENABLED=false`. Every request of the suite comes from 127.0.0.1, so the per-IP limits (1000 requests an hour, ten sign-ins a minute) are reached by the suite itself and answer 429 to whichever test comes next. No browser test relies on a real limit (`test_share_window_ui.py` fakes its 429 with `page.route`); the limits are covered by the Python tests. The published image's smoke test (`smoke_env.py`) keeps the limits.
 - A file leaves no rows in the admin's processing queue or inbox behind: a finished job is a row of the queue on every page, and the phone layout test measures the page. `clear_finished_jobs()` in `browser_checks.py` removes the completed and failed jobs; the offline recorder and trim tests call it when they end (the offline recorder test also deletes what it uploaded, and the toast test removes its upload and jobs itself), and the phone layout test calls it before it measures.
@@ -72,7 +72,7 @@ With `SPEAKR_E2E_SHOTS` set, a screenshot of each main step is saved in that dir
 
 `test_asr_editor_ui.py` covers the segment transcript editor in the browser: the transcript pane (speaker chips, compact times, text edited in place), Enter to split and Backspace to merge, speakers from the picker and the number keys, a voice-match suggestion accepted (in the pane and in the lane header of the timeline, with Undo in the message) and saved through the route of the speaker dialog, two labels matched to one person merged into one speaker, a speaker renamed and merged from the name in its lane header (with the voice-match control beside it left alone), a speaker added with the button in the header cell of the overview and saved only when it has a segment, a speaker without segments removed from its lane header (with undo and redo, and no such button on a lane with segments), selection with merge and delete, typed times and the problem count, undo and redo, find and replace as one undo step, the question before unsaved changes are discarded (the app's own dialog), the summary regenerated after a save when its checkbox is on (with the save request intercepted), the local draft, playback keys, and a phone-width layout. The timeline above the pane is driven with the mouse on its canvas: a click on the ruler seeks, a click on a block selects its row and a selected row is brought into view, an edge is dragged (with its touching neighbor, alone with Alt, snapping to the playhead and to other edges, cancelled with Esc), a click on a block that changes nothing, a block is dragged along its lane and to another lane, and empty lane space is dragged to add a segment, each checked as one undo step and against the saved transcript; on the phone layout a segment is added with touch events. The tests read the timeline's state through the handle the component puts on its canvas (`document.querySelector('[data-asr-timeline-canvas]').__tl`). A last test stores a transcript of 20,000 segments (about ten hours) and checks that only the rows in view are in the DOM, that the end of the list can be reached, that an edit there is saved, and that a full redraw of the timeline takes less than a frame (16 ms; it is built for under 4), printing the measured times.
 
-The recordings it opens come from `seed_recordings.py`, which `run_speakr.py` runs when it starts the instance (two finished recordings of the admin, each with a short WAV file, a tone in bursts where the transcript has speech, and a transcript of twelve segments; nothing here runs an ASR service). On an instance without them, such as the published image in `docker-publish.yml`, the tests are skipped. Each test first stores the seeded transcript again through the app's own save route, and the long transcript is replaced by the seeded one afterwards. It runs with the same gate and instance as the smoke test, in the same `browser-smoke` job:
+The recordings it opens come from `seed_recordings.py`, which `run_speakr.py` runs when it starts the instance (two finished recordings of the admin, each with a short WAV file, a tone in bursts where the transcript has speech, and a transcript of twelve segments; nothing here runs an ASR service). On an instance without them, such as a developer's own, the tests are skipped. With `SPEAKR_E2E_STRICT=1`, as in the `browser-smoke` job, a test that finds no seeded recordings, no Inquire page or no public links fails instead (`precondition_unmet` in `browser_checks.py`), because `run_speakr.py` always provides them there. Each test first stores the seeded transcript again through the app's own save route, and the long transcript is replaced by the seeded one afterwards. It runs with the same gate and instance as the smoke test, in the same `browser-smoke` job:
 
 ```bash
 SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_E2E_SHOTS=/tmp/shots \
@@ -233,4 +233,22 @@ SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_E2E_SHOTS=/t
 ```bash
 SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
   pytest tests/e2e/test_llm_admin_ui.py -q --noconftest -rs
+```
+
+## Rendered summary and notes browser test
+
+`test_rendered_html_ui.py` covers the summary and notes tabs of a recording when the `summary_html` and `notes_html` of the recording route hold hostile markup next to legitimate markup (#695). The answer of the route is rewritten in the browser. Headings, lists, a table, a highlighted code block, an https link and `dir="auto"` are shown; the `onerror` and `ontoggle` handlers and the `javascript:` link are removed, and no script runs. It runs with the same gate and instance as the smoke test:
+
+```bash
+SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 \
+  pytest tests/e2e/test_rendered_html_ui.py -q --noconftest -rs
+```
+
+## Account page markup browser test
+
+`test_account_markup_ui.py` covers the cards and lists that the account page builds in script with `safeHtml` (#692): Speakers (with voice snippets and the merge, delete and clear dialogs), Shares (with the permission editor and revoke), Tags, Templates, API tokens (with revoke) and Webhooks (with deliveries). The answers of their routes are replaced in the browser. With names, titles, identifiers and dates that hold markup and quotes, the values show as text, no attribute gains a handler and no script runs. With plain records, each tab is shown in the six UI themes, light and dark; with `SPEAKR_E2E_SHOTS` set, the markup of each tab in the default theme is saved as `account-markup-<tab>.html` for comparison with another version. It runs with the same gate and instance as the smoke test:
+
+```bash
+SPEAKR_BROWSER_SMOKE=1 SPEAKR_BASE_URL=http://127.0.0.1:8899 SPEAKR_E2E_SHOTS=/tmp/shots \
+  pytest tests/e2e/test_account_markup_ui.py -q --noconftest -rs
 ```

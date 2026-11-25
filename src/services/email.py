@@ -5,10 +5,12 @@ This module provides email functionality using Python's built-in smtplib.
 All email features are opt-in via environment variables.
 """
 
+import hmac
 import html
 import os
 import smtplib
 import logging
+import unicodedata
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -20,6 +22,7 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from flask import current_app, url_for
 
 from src.utils.localization import match_language, translate
+from src.utils.titles import TITLE_MAX_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,17 @@ def generate_password_reset_token(user_id: int) -> str:
     """Generate a password reset token."""
     serializer = get_serializer('password-reset')
     return serializer.dumps(user_id)
+
+
+def stored_token_matches(stored: Optional[str], token: str) -> bool:
+    """Whether a link token belongs to the hash stored on the user (#693).
+
+    Only the SHA-256 hash of a verification or reset token is stored, as for
+    API tokens, so a copy of the database holds no usable link. A link whose
+    token was used, cleared or replaced by a newer one does not match.
+    """
+    from src.utils.token_auth import hash_token
+    return bool(stored) and bool(token) and hmac.compare_digest(stored, hash_token(token))
 
 
 def verify_email_token(token: str) -> Optional[int]:
@@ -350,9 +364,10 @@ def send_verification_email(user) -> bool:
         logger.warning("Cannot send verification email: SMTP not configured")
         return False
 
-    # Generate token and store it
+    # Generate token and store its hash (#693)
+    from src.utils.token_auth import hash_token
     token = generate_verification_token(user.id)
-    user.email_verification_token = token
+    user.email_verification_token = hash_token(token)
     user.email_verification_sent_at = datetime.utcnow()
     db.session.commit()
 
@@ -421,9 +436,10 @@ def send_password_reset_email(user) -> bool:
         logger.warning("Cannot send password reset email: SMTP not configured")
         return False
 
-    # Generate token and store it
+    # Generate token and store its hash (#693)
+    from src.utils.token_auth import hash_token
     token = generate_password_reset_token(user.id)
-    user.password_reset_token = token
+    user.password_reset_token = hash_token(token)
     user.password_reset_sent_at = datetime.utcnow()
     db.session.commit()
 
@@ -650,6 +666,19 @@ def _format_duration(seconds) -> Optional[str]:
     return f'{secs}s'
 
 
+def _subject_safe_title(title: str) -> str:
+    """Return a readable, bounded title safe for a mail subject.
+
+    C0/C1 controls include CR and LF, which can break MIME serialisation or
+    inject another header. In the subject only, each run of them becomes one
+    space, so the words on either side stay apart; the body keeps the stored
+    title, with user-controlled HTML escaped by ``_h``.
+    """
+    safe = ''.join(' ' if unicodedata.category(ch) == 'Cc' else ch for ch in title)
+    safe = ' '.join(safe.split())
+    return safe[:TITLE_MAX_LENGTH].strip() or 'Untitled recording'
+
+
 def send_transcription_complete_email(user, recording) -> bool:
     """Tell a user their recording finished transcribing.
 
@@ -659,8 +688,9 @@ def send_transcription_complete_email(user, recording) -> bool:
         return False
 
     title = (getattr(recording, 'title', None) or 'Untitled recording').strip()
+    subject_title = _subject_safe_title(title)
     url = _recording_url(recording.id)
-    subject = f'Transcription ready: {title}'
+    subject = f'Transcription ready: {subject_title}'
 
     rows = [('Recording', title)]
     duration = _format_duration(getattr(recording, 'audio_duration_seconds', None))
@@ -710,8 +740,9 @@ def send_transcription_failed_email(user, recording, error: str = None) -> bool:
         return False
 
     title = (getattr(recording, 'title', None) or 'Untitled recording').strip()
+    subject_title = _subject_safe_title(title)
     url = _recording_url(recording.id)
-    subject = f'Transcription failed: {title}'
+    subject = f'Transcription failed: {subject_title}'
 
     # The worker's error text can carry an upstream URL or key, so it is
     # summarised rather than forwarded in full.

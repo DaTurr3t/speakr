@@ -10,7 +10,8 @@ All endpoints require token authentication via:
 - Authorization: Bearer <token>
 - X-API-Token: <token>
 - API-Token: <token>
-- ?token=<token> query parameter (deprecated; GET and HEAD only, #500)
+- ?token=<token> query parameter (deprecated; off unless api_query_tokens_enabled
+  is on, and then GET and HEAD only, #500, #688)
 """
 
 import os
@@ -23,7 +24,6 @@ from functools import wraps
 from src.utils.dates import FILTER_DATE_MAX, FILTER_DATE_MIN, to_utc_naive
 from src.utils.request_body import (flag_fields, id_args_error, json_body, json_object_body, is_db_id, is_int_list,
                                     parse_flag, str_field)
-from typing import Optional
 
 from flask import Blueprint, jsonify, request, current_app, send_file, redirect
 from flask_login import login_required, current_user
@@ -31,7 +31,7 @@ from src.utils.token_auth import public_route, require_scope, token_rate_key
 from src.services import audit
 from src.utils.speaker_labels import (MAX_SPEAKER_NAME_LENGTH, clean_participants, is_generic_speaker_label,
                                       real_speaker_names, speaker_map_name_too_long, speaker_name_too_long)
-from sqlalchemy import func, extract, or_, and_
+from sqlalchemy import func, extract, or_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -47,7 +47,6 @@ from src.services.transcription_tracking import transcription_tracker
 from src.file_exporter import format_transcription_with_template
 from src.api.recordings import (
     ingest_uploaded_recording,
-    upload_file as _upload_file_ui,
 )
 from src.services.storage import get_storage_service
 from src.utils.mime import served_media_mime, sandbox_media_response
@@ -131,7 +130,7 @@ OPENAPI_SPEC = {
     "openapi": "3.0.3",
     "info": {
         "title": "Speakr API",
-        "description": "REST API for Speakr - Audio transcription and note-taking application.\n\n## Authentication\nMost endpoints require token authentication via one of:\n- `Authorization: Bearer <token>`\n- `X-API-Token: <token>`\n- `API-Token: <token>`\n- `?token=<token>` query parameter (deprecated, GET only)\n\nA header is the preferred way to send a token. A token in `?token=` is accepted only on GET requests; any other method that carries the token only in the query string gets `401` with the code `query_token_read_only`, and every response to a request that uses `?token=` carries the header `Deprecation: true`.\n\nThe ASR Voice Recorder integration is the one exception: its required multipart `secret` field contains the personal Speakr API token because that client cannot set custom authorization headers. Generate tokens in Settings > API Tokens.",
+        "description": "REST API for Speakr - Audio transcription and note-taking application.\n\n## Authentication\nMost endpoints require token authentication via one of:\n- `Authorization: Bearer <token>`\n- `X-API-Token: <token>`\n- `API-Token: <token>`\n- `?token=<token>` query parameter (deprecated, off by default)\n\nA header is the preferred way to send a token. A token in `?token=` is accepted only when the administrator turns on `api_query_tokens_enabled`; otherwise a request that carries the token only in the query string gets `401` with the code `query_token_disabled`, on every method. When it is on, a token in `?token=` is accepted only on GET requests; any other method that carries the token only in the query string gets `401` with the code `query_token_read_only`. Every response to a request that uses `?token=` carries the header `Deprecation: true`.\n\nThe ASR Voice Recorder integration is the one exception: its required multipart `secret` field contains the personal Speakr API token because that client cannot set custom authorization headers. Generate tokens in Settings > API Tokens.",
         "version": "1.0.0"
     },
     "servers": [{"url": "/api/v1", "description": "API v1"}],
@@ -149,8 +148,10 @@ OPENAPI_SPEC = {
                                           "header."},
             "apiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-Token"},
             "apiKeyQuery": {"type": "apiKey", "in": "query", "name": "token", "x-deprecated": True,
-                            "description": "Deprecated. Accepted only on GET (and HEAD) requests; any other method "
-                                           "that carries the token only here gets 401 query_token_read_only. "
+                            "description": "Deprecated, and off by default: unless the administrator turns on "
+                                           "api_query_tokens_enabled, a token here gets 401 query_token_disabled. "
+                                           "When it is on, a token here is accepted only on GET (and HEAD) requests; "
+                                           "any other method that carries the token only here gets 401 query_token_read_only. "
                                            "Responses carry the header Deprecation: true. Send the token in "
                                            "the Authorization header instead. Scoped tokens are not accepted here."}
         },
@@ -3153,7 +3154,6 @@ def get_transcription_info():
     """
     from src.models import SystemSetting
     from src.config.app_config import (
-        TRANSCRIPTION_MODEL,
         USE_NEW_TRANSCRIPTION_ARCHITECTURE,
         USE_ASR_ENDPOINT,
     )
@@ -3515,8 +3515,6 @@ def assign_speakers(recording_id):
         "regenerate_summary": false
     }
     """
-    from src.services.speaker import update_speaker_usage
-    from src.services.job_queue import job_queue
 
     try:
         recording = db.session.get(Recording, recording_id)
@@ -3638,7 +3636,6 @@ def identify_speakers(recording_id):
 @audit.emits('recording.reprocessed')
 def start_transcription(recording_id):
     """Queue transcription for a recording."""
-    from src.services.job_queue import job_queue
 
     recording = db.session.get(Recording, recording_id)
     if not recording or not has_recording_access(recording, current_user):
@@ -3680,7 +3677,6 @@ def start_transcription(recording_id):
 @audit.emits('recording.reprocessed')
 def start_summarization(recording_id):
     """Queue summarization for a recording with optional custom prompt."""
-    from src.services.job_queue import job_queue
 
     recording = db.session.get(Recording, recording_id)
     if not recording or not has_recording_access(recording, current_user):
@@ -3921,7 +3917,6 @@ def get_recording_events(recording_id):
 @audit.access('recording.content.read', dedup=audit.DEDUP_VIEW, details={'part': 'events_ics'})
 def download_events_ics(recording_id):
     """Download all events as ICS file."""
-    from src.api.events import generate_ics_content
 
     recording = db.session.get(Recording, recording_id)
     if not recording or not has_recording_access(recording, current_user):
@@ -4236,7 +4231,6 @@ def batch_delete_recordings():
 @login_required
 def batch_transcribe_recordings():
     """Batch queue transcriptions for multiple recordings."""
-    from src.services.job_queue import job_queue
 
     data, body_error = json_object_body()
     if body_error:

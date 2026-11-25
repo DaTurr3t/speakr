@@ -161,9 +161,14 @@ def test_password_reset_request_and_reset(created):
     user = make_user(created)
     start = max_id()
     client = anonymous_client()
+    # SQLite can give this user the id of a user an earlier test deleted, and
+    # a reset request of that user may still sit in the same five-minute
+    # de-duplication bucket. A bucket of this test's own avoids that.
+    own_bucket = 2_000_000_000 + (uuid.uuid4().int % 100_000) * audit.DEDUP_RESET_REQUESTED
     with mock.patch.object(auth_mod, 'is_smtp_configured', return_value=True), \
             mock.patch.object(auth_mod, 'can_resend_password_reset', return_value=(True, 0)), \
-            mock.patch.object(auth_mod, 'send_password_reset_email', return_value=True):
+            mock.patch.object(auth_mod, 'send_password_reset_email', return_value=True), \
+            mock.patch.object(audit, '_epoch', return_value=own_bucket):
         client.post('/forgot-password', data={'email': user.email})
         client.post('/forgot-password', data={'email': user.email})
         client.post('/forgot-password', data={'email': 'SENTINELADDR@nowhere.test'})
@@ -171,10 +176,12 @@ def test_password_reset_request_and_reset(created):
     assert sorted((r.target_user_id or 0) for r in requested) == [0, user.id]
 
     user = db.session.get(User, user.id)
-    user.password_reset_token = 'tok-' + 'a' * 20
+    from src.utils.token_auth import hash_token
+    link_token = 'tok-' + 'a' * 20
+    user.password_reset_token = hash_token(link_token)
     db.session.commit()
     with mock.patch.object(auth_mod, 'verify_reset_token', return_value=user.id):
-        resp = client.post(f'/reset-password/{user.password_reset_token}', data={
+        resp = client.post(f'/reset-password/{link_token}', data={
             'password': 'An0ther-Passw0rd!', 'confirm_password': 'An0ther-Passw0rd!'})
     assert resp.status_code == 302
     reset = rows_after(start, 'auth.password.reset')
